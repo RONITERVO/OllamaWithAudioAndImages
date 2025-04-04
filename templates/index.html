@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ollama Web Chat</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            background-color: #f4f7f9;
+        }
+
+        header {
+            background-color: #4a5568;
+            /* Tailwind gray-700 */
+            color: white;
+            padding: 0.75rem 1rem;
+            text-align: center;
+            font-size: 1.25rem;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        #chatbox-container {
+            flex-grow: 1;
+            overflow-y: auto;
+            padding: 1rem;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #chatbox {
+            width: 100%;
+            max-width: 800px;
+            /* Limit width for readability */
+            margin: 0 auto;
+            /* Center chatbox */
+            flex-grow: 1;
+            /* Allow chatbox to grow */
+        }
+
+        .message {
+            margin-bottom: 0.75rem;
+            padding: 0.5rem 0.75rem;
+            border-radius: 0.5rem;
+            max-width: 85%;
+            /* Limit message width */
+            word-wrap: break-word;
+            line-height: 1.5;
+        }
+
+        .user {
+            background-color: #dbeafe;
+            /* Tailwind blue-100 */
+            color: #1e3a8a;
+            /* Tailwind blue-800 */
+            margin-left: auto;
+            /* Align user messages to right */
+            text-align: left;
+            border-bottom-right-radius: 0;
+        }
+
+        .assistant {
+            background-color: #e5e7eb;
+            /* Tailwind gray-200 */
+            color: #1f2937;
+            /* Tailwind gray-800 */
+            margin-right: auto;
+            /* Align assistant messages to left */
+            text-align: left;
+            border-bottom-left-radius: 0;
+        }
+
+        .error {
+            background-color: #fee2e2;
+            /* Tailwind red-100 */
+            color: #991b1b;
+            /* Tailwind red-800 */
+            font-weight: bold;
+            text-align: center;
+            margin: 0.5rem auto;
+            /* Center errors */
+            max-width: 90%;
+        }
+
+        .status {
+            font-style: italic;
+            color: #6b7280;
+            /* Tailwind gray-500 */
+            text-align: center;
+            font-size: 0.8rem;
+            margin: 0.5rem auto;
+            max-width: 90%;
+        }
+
+        #input-area {
+            display: flex;
+            padding: 0.75rem 1rem;
+            background-color: #ffffff;
+            box-shadow: 0 -2px 4px rgba(0, 0, 0, 0.05);
+            width: 100%;
+            max-width: 800px;
+            /* Limit width for readability */
+            margin: 0 auto;
+            /* Center input area */
+            box-sizing: border-box;
+            /* Include padding in width */
+        }
+
+        textarea {
+            flex-grow: 1;
+            margin-right: 0.5rem;
+            padding: 0.5rem 0.75rem;
+            border: 1px solid #d1d5db;
+            /* Tailwind gray-300 */
+            border-radius: 0.375rem;
+            resize: none;
+            /* Prevent resizing */
+            font-family: inherit;
+            font-size: 1rem;
+            line-height: 1.5;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: #3b82f6;
+            /* Tailwind blue-500 */
+            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3);
+        }
+
+        button {
+            padding: 0.5rem 1rem;
+            background-color: #3b82f6;
+            /* Tailwind blue-500 */
+            color: white;
+            border: none;
+            border-radius: 0.375rem;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: background-color 0.2s ease;
+        }
+
+        button:hover {
+            background-color: #2563eb;
+            /* Tailwind blue-600 */
+        }
+
+        button:disabled {
+            background-color: #9ca3af;
+            /* Tailwind gray-400 */
+            cursor: not-allowed;
+        }
+
+        /* Typing indicator */
+        .typing-indicator {
+            display: flex;
+            align-items: center;
+            margin-right: auto;
+            padding: 0.5rem 0.75rem;
+        }
+
+        .typing-indicator span {
+            height: 8px;
+            width: 8px;
+            background-color: #9ca3af;
+            /* Tailwind gray-400 */
+            border-radius: 50%;
+            display: inline-block;
+            margin: 0 2px;
+            animation: bounce 1.4s infinite ease-in-out both;
+        }
+
+        .typing-indicator span:nth-child(1) {
+            animation-delay: -0.32s;
+        }
+
+        .typing-indicator span:nth-child(2) {
+            animation-delay: -0.16s;
+        }
+
+        @keyframes bounce {
+
+            0%,
+            80%,
+            100% {
+                transform: scale(0);
+            }
+
+            40% {
+                transform: scale(1.0);
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <header>Ollama Web Chat</header>
+
+    <div id="chatbox-container">
+        <div id="chatbox">
+            <!-- Messages will be added here -->
+        </div>
+    </div>
+
+    <div id="input-area">
+        <textarea id="messageInput" rows="2" placeholder="Enter your message (Shift+Enter for newline)..."></textarea>
+        <button id="sendButton">Send</button>
+    </div>
+
+    <script>
+        const chatbox = document.getElementById('chatbox');
+        const messageInput = document.getElementById('messageInput');
+        const sendButton = document.getElementById('sendButton');
+        let currentAssistantMessageDiv = null;
+        let typingIndicatorDiv = null;
+        let eventSource = null; // Initialize eventSource variable
+
+        // --- Helper Functions ---
+
+        function scrollToBottom() {
+            const container = document.getElementById('chatbox-container');
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function createMessageDiv(role, text) {
+            const messageDiv = document.createElement('div');
+            messageDiv.classList.add('message', role);
+            // Use textContent to prevent HTML injection
+            messageDiv.textContent = text;
+            return messageDiv;
+        }
+
+        function addMessage(role, text) {
+            if (!text && role !== 'error' && role !== 'status') return; // Don't add empty standard messages
+
+            removeTypingIndicator(); // Remove indicator when a real message arrives
+
+            const messageDiv = createMessageDiv(role, text);
+            chatbox.appendChild(messageDiv);
+            scrollToBottom();
+            return messageDiv; // Return the div if needed (for streaming)
+        }
+
+        function createTypingIndicator() {
+            if (typingIndicatorDiv) return; // Already exists
+
+            typingIndicatorDiv = document.createElement('div');
+            typingIndicatorDiv.classList.add('message', 'assistant', 'typing-indicator'); // Style like assistant msg
+            typingIndicatorDiv.innerHTML = `<span></span><span></span><span></span>`;
+            chatbox.appendChild(typingIndicatorDiv);
+            scrollToBottom();
+        }
+
+        function removeTypingIndicator() {
+            if (typingIndicatorDiv) {
+                chatbox.removeChild(typingIndicatorDiv);
+                typingIndicatorDiv = null;
+            }
+        }
+
+        function startNewAssistantMessage() {
+            // Called when the first chunk of a new assistant response arrives
+            removeTypingIndicator(); // Ensure indicator is gone
+            currentAssistantMessageDiv = createMessageDiv('assistant', ''); // Start with empty text
+            chatbox.appendChild(currentAssistantMessageDiv);
+            scrollToBottom();
+        }
+
+        function appendToAssistantMessage(textChunk) {
+            // If this is the very first chunk, create the message div
+            if (!currentAssistantMessageDiv) {
+                startNewAssistantMessage();
+            }
+            // Append new text using textContent for security
+            currentAssistantMessageDiv.textContent += textChunk;
+            scrollToBottom();
+        }
+
+        function finalizeAssistantMessage() {
+            // Called when the 'end' event is received
+            removeTypingIndicator(); // Just in case
+            // Mark the current assistant message as complete (no longer expecting chunks)
+            currentAssistantMessageDiv = null;
+        }
+
+        // --- API Interaction ---
+
+        // Fetch initial history
+        function fetchHistory() {
+            addMessage('status', 'Loading history...');
+            fetch('/get_history')
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    chatbox.innerHTML = ''; // Clear placeholder/old content
+                    if (data.history && data.history.length > 0) {
+                        data.history.forEach(msg => {
+                            // Display history messages (simplified representation)
+                            const role = msg.role || 'unknown';
+                            const content = msg.content || '[empty message]';
+                            const displayRole = role === 'assistant' ? 'Ollama' : 'You';
+                            addMessage(role, `${displayRole}: ${content}`);
+                        });
+                        addMessage('status', 'History loaded.');
+                    } else {
+                        addMessage('status', 'No previous chat history found.');
+                    }
+                })
+                .catch(error => {
+                    console.error('Error fetching history:', error);
+                    chatbox.innerHTML = ''; // Clear on error too
+                    addMessage('error', `Failed to load chat history: ${error.message}. Please refresh.`);
+                });
+        }
+
+        // Send message function
+        function sendMessage() {
+            const message = messageInput.value.trim();
+            if (!message) return; // Don't send empty messages
+
+            addMessage('user', `You: ${message}`); // Display user message immediately
+            messageInput.value = ''; // Clear input
+            messageInput.disabled = true; // Disable input while waiting
+            sendButton.disabled = true;
+            createTypingIndicator(); // Show indicator
+
+            fetch('/send_message', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message: message })
+            })
+                .then(response => {
+                    // Check for non-JSON or error responses first
+                    if (!response.ok) {
+                        return response.text().then(text => { // Try to get error text
+                            throw new Error(`Server error: ${response.status} - ${text || 'Unknown error'}`);
+                        });
+                    }
+                    // Only parse JSON if response is OK
+                    return response.json();
+                })
+                .then(data => {
+                    console.log('Send status:', data);
+                    if (data.status !== 'success') {
+                        removeTypingIndicator(); // Remove indicator on error
+                        addMessage('error', `Failed to send message: ${data.message || 'Server error'}`);
+                    }
+                    // Streaming via EventSource will handle the response display
+                    // Re-enable input is handled by stream end/error
+                })
+                .catch(error => {
+                    console.error('Error sending message:', error);
+                    removeTypingIndicator(); // Remove indicator on error
+                    addMessage('error', `Network error sending message: ${error.message}`);
+                    // Re-enable input on network error so user can retry
+                    messageInput.disabled = false;
+                    sendButton.disabled = false;
+                });
+        }
+
+        // Setup Server-Sent Events (SSE)
+        function setupSSE() {
+            console.log("Setting up SSE connection...");
+            // Close existing connection if any
+            if (eventSource) {
+                console.log("Closing previous SSE connection.");
+                eventSource.close();
+            }
+
+            eventSource = new EventSource('/stream');
+
+            eventSource.onopen = function () {
+                console.log("SSE Connection opened.");
+                addMessage('status', 'Connected to server stream.');
+                // Re-enable input when connection is established (might have been disabled by error)
+                messageInput.disabled = false;
+                sendButton.disabled = false;
+            };
+
+            // Listener for 'message' events (our chunks)
+            eventSource.addEventListener('message', function (event) {
+                // console.log("SSE message:", event.data); // Can be noisy
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'chunk' && data.content) {
+                        appendToAssistantMessage(data.content);
+                    } else {
+                        console.warn("Received non-chunk message event:", data);
+                    }
+                } catch (e) {
+                    console.error("Failed to parse SSE message data:", e, "Data:", event.data);
+                    // Maybe display raw data if parsing fails?
+                    // appendToAssistantMessage(` [Unparseable data: ${event.data}] `);
+                }
+            });
+
+            // Listener for 'end' events
+            eventSource.addEventListener('end', function (event) {
+                console.log("SSE end event received:", event.data);
+                finalizeAssistantMessage();
+                // Re-enable input controls after response is fully received
+                messageInput.disabled = false;
+                sendButton.disabled = false;
+                messageInput.focus(); // Focus input for next message
+            });
+
+            // Listener for 'error' events (from backend sending error type)
+            eventSource.addEventListener('error', function (event) {
+                console.log("SSE custom error event received:", event.data);
+                removeTypingIndicator(); // Remove indicator on error
+                try {
+                    const data = JSON.parse(event.data);
+                    addMessage('error', data.content || 'An error occurred in the backend stream.');
+                } catch (e) {
+                    addMessage('error', 'An unknown error occurred in the backend stream.');
+                }
+                // Re-enable input on error
+                messageInput.disabled = false;
+                sendButton.disabled = false;
+            });
+
+
+            // Listener for general SSE errors (connection issues)
+            eventSource.onerror = function (event) {
+                removeTypingIndicator(); // Remove indicator on error
+                console.error("SSE Error:", event);
+                // Disable input while disconnected
+                messageInput.disabled = true;
+                sendButton.disabled = true;
+
+                if (event.target.readyState === EventSource.CLOSED) {
+                    console.log('SSE Connection closed by server or network issue.');
+                    addMessage('error', 'Connection to server lost. Attempting to reconnect...');
+                    // SSE should attempt reconnection automatically by default
+                    // Optionally, implement manual reconnect logic here if needed
+                    // setTimeout(setupSSE, 5000); // Example manual retry
+                } else if (event.target.readyState === EventSource.CONNECTING) {
+                    console.log('SSE Connection lost. Reconnecting...');
+                    addMessage('status', 'Reconnecting to server stream...');
+                } else {
+                    // Other types of errors
+                    addMessage('error', 'An unexpected SSE connection error occurred.');
+                }
+                // Do not finalize message here, wait for reconnect or explicit end
+            };
+        }
+
+
+        // --- Event Listeners ---
+        sendButton.addEventListener('click', sendMessage);
+
+        messageInput.addEventListener('keypress', function (e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault(); // Prevent default newline
+                sendMessage();
+            }
+        });
+
+        // --- Initial Load ---
+        fetchHistory(); // Load history when page loads
+        setupSSE(); // Connect to the stream
+
+    </script>
+</body>
+
+</html>
