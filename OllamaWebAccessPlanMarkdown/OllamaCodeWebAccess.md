@@ -1558,48 +1558,83 @@ def update_vad_status(text, color):
 def fetch_available_models():
     """Fetches available Ollama models (robust parsing)."""
     try:
+        print("[Ollama Fetch] Calling ollama.list()...")
         models_data = ollama.list()
+        print(f"[Ollama Fetch] Received raw data type: {type(models_data)}")
+        # print(f"[Ollama Fetch] Raw data: {models_data}") # Uncomment for deep debugging if needed
+        
         valid_models = []
 
-        # Handle response format (adapt based on observed ollama library versions)
-        # Common format is a dictionary with a 'models' key -> list of dictionaries
-        if isinstance(models_data, dict) and 'models' in models_data:
+        # --- NEW: Check for object with 'models' attribute containing Model objects ---
+        if hasattr(models_data, 'models') and isinstance(models_data.models, list):
+            print("[Ollama Fetch] Parsing as object with 'models' list attribute...")
+            for model_obj in models_data.models:
+                if hasattr(model_obj, 'model') and isinstance(model_obj.model, str):
+                    valid_models.append(model_obj.model)
+                elif hasattr(model_obj, 'name') and isinstance(model_obj.name, str): # Backup check for 'name' attribute
+                     valid_models.append(model_obj.name)
+                else:
+                    print(f"[Ollama Fetch] Warning: Model object missing 'model' or 'name' string attribute: {model_obj}")
+            if valid_models:
+                 print(f"[Ollama Fetch] Successfully parsed {len(valid_models)} models via object attribute.")
+            else:
+                 print("[Ollama Fetch] Parsed object attribute, but found no valid model names.")
+
+
+        # --- Fallback: Check for dictionary structure (older versions?) ---
+        elif isinstance(models_data, dict) and 'models' in models_data:
+            print("[Ollama Fetch] Parsing as dictionary with 'models' key...")
             models_list = models_data.get('models', [])
             if isinstance(models_list, list):
                 for model_info in models_list:
                     if isinstance(model_info, dict) and 'name' in model_info:
                         valid_models.append(model_info['name'])
                     else:
-                        print(f"[Ollama] Warning: Skipping unexpected model entry format: {model_info}")
+                        print(f"[Ollama Fetch] Warning: Skipping unexpected model entry format in dict: {model_info}")
+                if valid_models:
+                    print(f"[Ollama Fetch] Successfully parsed {len(valid_models)} models via dictionary key.")
+                else:
+                     print("[Ollama Fetch] Parsed dictionary key, but found no valid model names.")
             else:
-                 print(f"[Ollama] Warning: 'models' key does not contain a list: {models_list}")
+                print("[Ollama Fetch] Warning: 'models' key does not contain a list in dictionary.")
 
-        # Fallback for potential other formats (e.g., list of strings directly - less common)
+        # --- Fallback: Check for direct list of strings/dicts ---
         elif isinstance(models_data, list):
+             print("[Ollama Fetch] Parsing as direct list...")
              for item in models_data:
                   if isinstance(item, str):
                        valid_models.append(item)
-                  elif isinstance(item, dict) and 'name' in item: # Handle list of dicts too
+                  elif isinstance(item, dict) and 'name' in item:
                        valid_models.append(item['name'])
              if valid_models:
-                  print("[Ollama] Warning: Received a direct list of models, parsed successfully.")
+                  print(f"[Ollama Fetch] Successfully parsed {len(valid_models)} models via direct list.")
+             else:
+                  print("[Ollama Fetch] Parsed direct list, but found no valid model names.")
 
+        # --- Handle No Models Found ---
         if not valid_models:
-             print("[Ollama] No valid models found in response or response format unrecognized.")
-             print(f"[Ollama] Received data: {models_data}")
+             print("[Ollama Fetch] No valid models identified after parsing attempts.")
+             print(f"[Ollama Fetch] Final raw data received was: {models_data}")
              # Provide common fallbacks
-             return [DEFAULT_OLLAMA_MODEL, "llama3:8b", "phi3:mini", "gemma:7b"]
+             valid_models = [DEFAULT_OLLAMA_MODEL, "llama3:8b", "phi3:mini", "gemma:7b"]
+             print(f"[Ollama Fetch] Returning fallback models: {valid_models}")
+             return valid_models # Return fallbacks
 
         # Sort models for better UI presentation
         valid_models.sort()
-        print(f"[Ollama] Found models: {valid_models}")
+        print(f"[Ollama Fetch] Found and sorted models: {valid_models}")
         return valid_models
 
     except Exception as e:
-        print(f"[Ollama] Error fetching models: {e}")
-        add_message_to_ui("error", f"Could not fetch Ollama models: {e}. Check if Ollama is running.")
+        print(f"[Ollama Fetch] Error during ollama.list() or parsing: {e}")
+        traceback.print_exc()
+        # Use schedule to add error to UI safely if window exists
+        if 'window' in globals() and window and window.winfo_exists():
+             window.after(0, lambda: add_message_to_ui("error", f"Could not fetch Ollama models: {e}. Check Ollama status."))
         # Provide common fallbacks if API fails
-        return [DEFAULT_OLLAMA_MODEL, "llama3:8b", "phi3:mini", "gemma:7b"]
+        fallbacks = [DEFAULT_OLLAMA_MODEL, "llama3:8b", "phi3:mini", "gemma:7b"]
+        print(f"[Ollama Fetch] Returning fallback models due to error: {fallbacks}")
+        return fallbacks
 
 def chat_worker(user_message_content, image_path=None):
     """Background worker for Ollama streaming chat (Thread-safe history)."""
@@ -2387,11 +2422,10 @@ whisper_model_size_selector = ttk.Combobox(size_frame, values=WHISPER_MODEL_SIZE
 whisper_model_size_selector.pack(side=tk.LEFT, padx=2)
 whisper_model_size_selector.bind("<<ComboboxSelected>>", set_whisper_model_size)
 
-
-# Auto-send checkbox
+# Auto-send checkbox (Corrected)
 auto_send_checkbox = ttk.Checkbutton(voice_outer_frame, text="Auto-send",
-                                     variable=auto_send_after_transcription,
-                                     tooltip="Automatically send message after voice transcription") # requires tktooltip maybe
+                                     variable=auto_send_after_transcription)
+                                     # tooltip="Automatically send message after voice transcription") # Removed this line
 auto_send_checkbox.pack(anchor="w", pady=2)
 
 
