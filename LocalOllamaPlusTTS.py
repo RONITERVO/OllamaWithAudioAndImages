@@ -655,7 +655,7 @@ def toggle_voice_recognition():
     global py_audio, whisper_processing_thread
 
     set_whisper_language()
-    
+
     if voice_enabled.get():
         print("[Voice] Enabling voice recognition...")
         all_initialized = True
@@ -698,6 +698,70 @@ def toggle_voice_recognition():
         print("[Voice] Voice recognition disabled.")
         # Note: We keep the whisper processing thread alive, it waits on the queue.
         # We also keep PyAudio initialized unless explicitly closed on app exit.
+
+# Add paste from clipboard functionality
+def paste_image_from_clipboard(event=None):
+    """Pastes an image from the clipboard."""
+    global selected_image_path, image_sent_in_history
+    try:
+        # Get image from clipboard
+        import io
+        from PIL import ImageGrab
+        
+        clipboard_image = ImageGrab.grabclipboard()
+        
+        if clipboard_image is None or not isinstance(clipboard_image, Image.Image):
+            print("[Image] No image found in clipboard")
+            add_message_to_ui("status", "No image found in clipboard. Try copying an image first.")
+            return
+            
+        # Save to temporary file
+        temp_file = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        temp_path = temp_file.name
+        temp_file.close()
+        
+        clipboard_image.save(temp_path, "PNG")
+        
+        # Update application state
+        selected_image_path = temp_path
+        image_sent_in_history = False
+        
+        # Update UI
+        update_image_preview(temp_path)
+        image_indicator.config(text=f"✓ Pasted image")
+        print(f"[Image] Image pasted from clipboard and saved to {temp_path}")
+        
+    except Exception as e:
+        print(f"[Image] Error pasting image: {e}")
+        add_message_to_ui("error", f"Failed to paste image: {e}")
+
+# Add key bindings for paste (this should be added before mainloop)
+def setup_paste_binding():
+    """Sets up the keyboard binding for paste."""
+    # Bind to main window for global paste
+    window.bind("<Control-v>", paste_image_from_clipboard)
+    # Also bind to the message input for convenience
+    user_input_widget.bind("<Control-v>", lambda e: after_paste_check(e))
+    # For Mac users
+    window.bind("<Command-v>", paste_image_from_clipboard)
+    user_input_widget.bind("<Command-v>", lambda e: after_paste_check(e))
+    
+def after_paste_check(event):
+    """Check if text was pasted, otherwise try to paste image."""
+    # Small delay to let the text paste complete if it's text
+    window.after(10, lambda: check_if_text_pasted(event))
+    
+def check_if_text_pasted(event):
+    """Determines if text was pasted or if we should try for an image."""
+    # If cursor position changed, text was probably pasted
+    # Otherwise, try image paste
+    try:
+        paste_image_from_clipboard(event)
+    except Exception as e:
+        print(f"[Image] Error in paste handling: {e}")
+    
+    # Don't block default paste behavior
+    return
 
 def set_whisper_language(event=None):
     """Sets the language for Whisper transcription."""
@@ -1310,6 +1374,9 @@ window.after(1500, toggle_voice_recognition)  # Call with slight delay after TTS
 
 # Start periodic checks (TTS flush)
 window.after(200, periodic_tts_check)
+
+# Set up paste binding
+setup_paste_binding()
 
 # --- Start Main Loop ---
 window.mainloop()
