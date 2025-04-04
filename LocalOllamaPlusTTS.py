@@ -164,7 +164,8 @@ def set_speech_rate(value=None): # Updated to accept value from scale command
     global tts_engine, tts_rate, tts_initialized_successfully
     if not tts_initialized_successfully or not tts_engine: return
     try:
-        rate = tts_rate.get()
+        rate = int(float(value))
+        tts_rate.set(rate)
         tts_engine.setProperty('rate', rate)
         # print(f"[TTS] Speech rate set to: {rate}") # Optional: Can be noisy
     except Exception as e:
