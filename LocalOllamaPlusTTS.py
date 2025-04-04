@@ -18,6 +18,7 @@ import torch
 import torchaudio
 from collections import deque
 import traceback
+import fitz
 
 
 # ===================
@@ -719,6 +720,70 @@ def toggle_voice_recognition():
         # Note: We keep the whisper processing thread alive, it waits on the queue.
         # We also keep PyAudio initialized unless explicitly closed on app exit.
 
+def extract_pdf_content(pdf_path):
+    """Extracts text content from a PDF file."""
+    try:
+        doc = fitz.open(pdf_path)
+        text_content = ""
+        
+        # Add basic metadata
+        metadata = doc.metadata
+        if metadata:
+            text_content += f"PDF Title: {metadata.get('title', 'N/A')}\n"
+            text_content += f"Author: {metadata.get('author', 'N/A')}\n\n"
+            
+        # Extract text from each page
+        for page_num, page in enumerate(doc):
+            text_content += f"--- Page {page_num+1} ---\n"
+            text_content += page.get_text()
+            text_content += "\n\n"
+            
+        doc.close()
+        return text_content
+    except Exception as e:
+        return f"Error extracting PDF content: {str(e)}"
+    
+
+def select_pdf():
+    """Opens dialog to select a PDF file and insert its content into the input field."""
+    global user_input_widget
+    
+    file_path = filedialog.askopenfilename(
+        title="Select PDF File",
+        filetypes=[("PDF files", "*.pdf")]
+    )
+    
+    if file_path:
+        # Show loading indicator
+        add_message_to_ui("status", f"Loading PDF: {os.path.basename(file_path)}...")
+        
+        # Extract content in a separate thread to avoid freezing UI
+        def extract_and_update():
+            content = extract_pdf_content(file_path)
+            
+            # Truncate if extremely long
+            if len(content) > 10000:
+                content = content[:10000] + "\n\n[Content truncated due to length. Consider splitting the PDF or selecting fewer pages]"
+            
+            # Update UI in main thread
+            window.after(0, lambda: update_input_with_pdf_content(content, file_path))
+        
+        thread = threading.Thread(target=extract_and_update, daemon=True)
+        thread.start()
+
+def update_input_with_pdf_content(content, file_path):
+    """Updates the user input with extracted PDF content."""
+    global user_input_widget
+    
+    # Clear current content
+    user_input_widget.delete("1.0", tk.END)
+    
+    # Insert PDF content
+    user_input_widget.insert("1.0", content)
+    
+    # Notify user
+    add_message_to_ui("status", f"PDF loaded: {os.path.basename(file_path)}")
+
 # Add paste from clipboard functionality
 def paste_image_from_clipboard(event=None):
     """Pastes an image from the clipboard."""
@@ -1330,20 +1395,22 @@ bottom_frame = tk.Frame(main_frame)
 bottom_frame.pack(fill=tk.X, expand=False)
 
 # Image Frame (Left)
-image_frame = tk.LabelFrame(bottom_frame, text="Image Attachment", padx=5, pady=5)
+image_frame = tk.LabelFrame(bottom_frame, text="Attachments", padx=5, pady=5)
 image_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
 
-image_preview = tk.Label(image_frame, text="No Image", width=20, height=8, bg="lightgrey", relief="sunken") # Adjusted size
+image_preview = tk.Label(image_frame, text="No Image", width=20, height=8, bg="lightgrey", relief="sunken")
 image_preview.pack(pady=5)
 
 img_button_frame = tk.Frame(image_frame)
 img_button_frame.pack(fill=tk.X, pady=2)
-select_button = tk.Button(img_button_frame, text="Select", command=select_image, width=8)
+select_button = tk.Button(img_button_frame, text="Image", command=select_image, width=6)
 select_button.pack(side=tk.LEFT, expand=True, padx=2)
-clear_button = tk.Button(img_button_frame, text="Clear", command=clear_image, width=8)
+pdf_button = tk.Button(img_button_frame, text="PDF", command=select_pdf, width=6)
+pdf_button.pack(side=tk.LEFT, expand=True, padx=2)
+clear_button = tk.Button(img_button_frame, text="Clear", command=clear_image, width=6)
 clear_button.pack(side=tk.LEFT, expand=True, padx=2)
 
-image_indicator = tk.Label(image_frame, text="No image attached", font=("Arial", 8, "italic"), fg="grey")
+image_indicator = tk.Label(image_frame, text="No attachments", font=("Arial", 8, "italic"), fg="grey")
 image_indicator.pack(pady=(3,0))
 
 
