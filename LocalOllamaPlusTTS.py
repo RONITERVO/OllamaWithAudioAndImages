@@ -185,6 +185,10 @@ def tts_worker():
                 with tts_busy_lock:
                     tts_busy = True
 
+                # Refresh voice setting before each say() call
+                if tts_voice_id.get():
+                    tts_engine.setProperty('voice', tts_voice_id.get())
+
                 # print(f"[TTS Worker] Speaking chunk ({len(text_to_speak)} chars)...")
                 # start_time = time.time()
                 tts_engine.say(text_to_speak)
