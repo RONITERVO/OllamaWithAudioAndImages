@@ -19,6 +19,7 @@ import torchaudio
 from collections import deque
 import traceback
 import fitz
+from tkinterdnd2 import TkinterDnD, DND_FILES
 
 
 # ===================
@@ -848,6 +849,66 @@ def check_if_text_pasted(event):
     # Don't block default paste behavior
     return
 
+# Add these functions for drag and drop handling
+def handle_image_drop(event):
+    """Handle dropped image files."""
+    global selected_image_path, image_sent_in_history
+    file_path = event.data.strip('{}')
+    if file_path and os.path.isfile(file_path):
+        file_ext = os.path.splitext(file_path)[1].lower()
+        if file_ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
+            selected_image_path = file_path
+            image_sent_in_history = False
+            update_image_preview(file_path)
+            image_indicator.config(text=f"✓ {os.path.basename(file_path)}")
+            # Provide visual feedback
+            image_preview.config(bg="lightgreen")
+            window.after(500, lambda: image_preview.config(bg="lightgrey"))
+
+def handle_pdf_drop(event):
+    """Handle dropped PDF files."""
+    file_path = event.data.strip('{}')
+    if file_path and os.path.isfile(file_path) and file_path.lower().endswith('.pdf'):
+        # Show loading indicator
+        add_message_to_ui("status", f"Loading PDF: {os.path.basename(file_path)}...")
+        
+        # Extract content in a separate thread to avoid freezing UI
+        def extract_and_update():
+            content = extract_pdf_content(file_path)
+            
+            # Truncate if extremely long
+            if len(content) > 10000:
+                content = content[:10000] + "\n\n[Content truncated due to length. Consider splitting the PDF or selecting fewer pages]"
+            
+            # Update UI in main thread
+            window.after(0, lambda: update_input_with_pdf_content(content, file_path))
+        
+        thread = threading.Thread(target=extract_and_update, daemon=True)
+        thread.start()
+
+def handle_text_drop(event):
+    """Handle any file drop to the text input area."""
+    file_path = event.data.strip('{}')
+    if file_path and os.path.isfile(file_path):
+        file_ext = os.path.splitext(file_path)[1].lower()
+        if file_ext == '.pdf':
+            handle_pdf_drop(event)
+        elif file_ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
+            handle_image_drop(event)
+        elif file_ext in ['.txt', '.md', '.py', '.js', '.html', '.css', '.json']:
+            # Handle text file drop
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    # Truncate if very long
+                    if len(content) > 10000:
+                        content = content[:10000] + "\n\n[Content truncated due to length]"
+                    user_input_widget.delete("1.0", tk.END)
+                    user_input_widget.insert("1.0", content)
+                add_message_to_ui("status", f"Text loaded from: {os.path.basename(file_path)}")
+            except Exception as e:
+                add_message_to_ui("error", f"Error loading text file: {e}")
+
 def set_whisper_language(event=None):
     """Sets the language for Whisper transcription."""
     global whisper_language, whisper_language_selector
@@ -1245,7 +1306,7 @@ def on_closing():
 
 
 # --- Build GUI ---
-window = tk.Tk()
+window = TkinterDnD.Tk()
 window.title(APP_TITLE)
 window.geometry(WINDOW_GEOMETRY)
 
@@ -1395,11 +1456,16 @@ bottom_frame = tk.Frame(main_frame)
 bottom_frame.pack(fill=tk.X, expand=False)
 
 # Image Frame (Left)
-image_frame = tk.LabelFrame(bottom_frame, text="Attachments", padx=5, pady=5)
+image_frame = tk.LabelFrame(bottom_frame, text="Attachments (or Drag & Drop)", padx=5, pady=5)
 image_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
 
-image_preview = tk.Label(image_frame, text="No Image", width=20, height=8, bg="lightgrey", relief="sunken")
+image_preview = tk.Label(image_frame, text="No Image\nDrop image here", width=20, height=8, 
+                        bg="lightgrey", relief="sunken")
 image_preview.pack(pady=5)
+
+# Register the image preview as a drop target
+image_preview.drop_target_register(DND_FILES)
+image_preview.dnd_bind('<<Drop>>', handle_image_drop)
 
 img_button_frame = tk.Frame(image_frame)
 img_button_frame.pack(fill=tk.X, pady=2)
@@ -1414,13 +1480,17 @@ image_indicator = tk.Label(image_frame, text="No attachments", font=("Arial", 8,
 image_indicator.pack(pady=(3,0))
 
 
-# Input Frame (Right - Takes remaining space)
-input_frame = tk.LabelFrame(bottom_frame, text="Your Message (Press Enter to Send, Shift+Enter for Newline)", padx=10, pady=5)
+# Update the input frame title to indicate drag & drop 
+input_frame = tk.LabelFrame(bottom_frame, text="Your Message (Enter to Send, Shift+Enter for Newline, Drag Files Here)", padx=10, pady=5)
 input_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-user_input_widget = scrolledtext.ScrolledText(input_frame, wrap=tk.WORD, height=4, font=("Arial", 10)) # Adjusted height
+user_input_widget = scrolledtext.ScrolledText(input_frame, wrap=tk.WORD, height=4, font=("Arial", 10))
 user_input_widget.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
 user_input_widget.focus_set()
+
+# Register the text input as a drop target
+user_input_widget.drop_target_register(DND_FILES)
+user_input_widget.dnd_bind('<<Drop>>', handle_text_drop)
 
 send_button = tk.Button(input_frame, text="Send", command=send_message, width=10)
 send_button.pack(pady=5, anchor='e') # Anchor to the right
