@@ -425,6 +425,7 @@ def vad_worker():
     """Worker thread for continuous VAD and triggering recording."""
     global py_audio, audio_stream, vad_audio_buffer, audio_frames_buffer, is_recording_for_whisper
     global vad_model, vad_get_speech_ts, vad_stop_event, temp_audio_file_path, whisper_queue
+    global tts_busy, tts_busy_lock  # Add access to TTS state variables
 
     print("[VAD Worker] Thread started.")
     
@@ -445,10 +446,38 @@ def vad_worker():
         pre_speech_buffer_frames = int(PRE_SPEECH_BUFFER_SECONDS * RATE / VAD_CHUNK)
 
         temp_pre_speech_buffer = deque(maxlen=pre_speech_buffer_frames)
+        was_tts_busy = False  # Track previous TTS state for status transitions
 
         while not vad_stop_event.is_set():
             try:
                 data = stream.read(VAD_CHUNK, exception_on_overflow=False)
+                
+                # Check if TTS is active
+                with tts_busy_lock:
+                    current_tts_busy = tts_busy
+                
+                if current_tts_busy:
+                    # TTS is active - don't process this audio
+                    if is_recording_for_whisper:
+                        # Cancel any ongoing recording to avoid capturing TTS audio
+                        print("[VAD Worker] Canceling recording due to TTS activity")
+                        is_recording_for_whisper = False
+                        audio_frames_buffer.clear()
+                    
+                    # Only update status when transitioning to busy state
+                    if not was_tts_busy:
+                        update_vad_status("VAD Paused (TTS Active)", "blue")
+                        was_tts_busy = True
+                    
+                    # Skip the rest of this iteration
+                    continue
+                
+                # Handle transition from TTS busy to not busy
+                if was_tts_busy and not current_tts_busy:
+                    update_vad_status("Listening...", "gray")
+                    was_tts_busy = False
+                
+                # Normal VAD processing continues below
                 audio_chunk_np = np.frombuffer(data, dtype=np.int16)
                 vad_audio_buffer.append(audio_chunk_np)
                 temp_pre_speech_buffer.append(data) # Store raw bytes for pre-buffer
@@ -487,7 +516,7 @@ def vad_worker():
                             recording_duration = len(audio_frames_buffer) * VAD_CHUNK / RATE
                             print(f"[VAD Worker] Recording duration: {recording_duration:.2f}s")
                             
-                            # Only process recordings longer than 0.8 seconds
+                            # Only process recordings longer than minimum threshold
                             if recording_duration < 0.6 + PRE_SPEECH_BUFFER_SECONDS + SILENCE_THRESHOLD_SECONDS:
                                 print(f"[VAD Worker] Recording too short ({recording_duration:.2f}s < {0.8 + PRE_SPEECH_BUFFER_SECONDS + SILENCE_THRESHOLD_SECONDS:.2f}s), discarding.")
                                 # Reset state without processing
@@ -518,17 +547,9 @@ def vad_worker():
                                 audio_frames_buffer.clear()
                                 update_vad_status("Processing...", "blue") # UI update happens via whisper worker later
                         
-                        # If not recording, just continue listening
+                        # If not recording, show listening status
                         if not is_recording_for_whisper:
                              update_vad_status("Listening...", "gray")
-
-
-                # Prevent buffer from growing indefinitely if VAD somehow fails often
-                # (deque maxlen should handle this, but as a safeguard)
-                # if len(vad_audio_buffer) > vad_audio_buffer.maxlen * 2:
-                #     print("[VAD Worker] Warning: Audio buffer seems overly large, clearing.")
-                #     vad_audio_buffer.clear()
-
 
             except IOError as e:
                 # Handle stream errors, e.g., input overflow
@@ -536,7 +557,6 @@ def vad_worker():
                     print("[VAD Worker] Warning: Input overflowed. Skipping frame.")
                 else:
                     print(f"[VAD Worker] Stream read error: {e}")
-                    # Maybe try to reopen stream or signal error? For now, just continue.
                     time.sleep(0.1) # Avoid busy-looping on error
             except Exception as e:
                 print(f"[VAD Worker] Unexpected error: {e}")
@@ -545,8 +565,8 @@ def vad_worker():
     except Exception as e:
         print(f"[VAD Worker] Failed to open audio stream: {e}")
         update_vad_status("Audio Error!", "red")
-        # Signal failure? Maybe disable voice recognition?
     finally:
+        # Cleanup code remains the same
         if stream:
             try:
                 stream.stop_stream()
