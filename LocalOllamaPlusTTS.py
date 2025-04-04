@@ -729,7 +729,33 @@ def fetch_available_models():
     """Fetches available Ollama models."""
     try:
         models_data = ollama.list()
-        return [model['name'] for model in models_data.get('models', [])]
+        valid_models = []
+        
+        # Case 1: New format - models_data has a 'models' attribute that contains Model objects
+        if hasattr(models_data, 'models') and isinstance(models_data.models, list):
+            for model_obj in models_data.models:
+                if hasattr(model_obj, 'model'):
+                    valid_models.append(model_obj.model)
+                else:
+                    print(f"[Ollama] Warning: Model object missing 'model' attribute: {model_obj}")
+        
+        # Case 2: Old format - models_data is a dict with 'models' key containing dicts
+        elif isinstance(models_data, dict) and 'models' in models_data:
+            models_list = models_data.get('models', [])
+            if isinstance(models_list, list):
+                for model in models_list:
+                    if isinstance(model, dict) and 'name' in model:
+                        valid_models.append(model['name'])
+                    else:
+                        print(f"[Ollama] Warning: Skipping invalid model entry: {model}")
+        
+        # Log warning for unexpected format
+        else:
+            print(f"[Ollama] Warning: Unexpected format received from ollama.list(). Got: {models_data}")
+        
+        # Return valid models or fallback list if none found
+        return valid_models if valid_models else [DEFAULT_OLLAMA_MODEL, "llama3:8b", "phi3:mini"]
+    
     except Exception as e:
         print(f"[Ollama] Error fetching models: {e}")
         # Provide common fallbacks if API fails
