@@ -745,32 +745,57 @@ def extract_pdf_content(pdf_path):
         return f"Error extracting PDF content: {str(e)}"
     
 
-def select_pdf():
-    """Opens dialog to select a PDF file and insert its content into the input field."""
-    global user_input_widget
-    
+def select_file():
+    """Opens dialog to select any supported file type."""
     file_path = filedialog.askopenfilename(
-        title="Select PDF File",
-        filetypes=[("PDF files", "*.pdf")]
+        title="Select File",
+        filetypes=[
+            ("All Supported Files", "*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.pdf;*.txt;*.md;*.py;*.js;*.html;*.css;*.json"),
+            ("Image files", "*.png;*.jpg;*.jpeg;*.gif;*.bmp"),
+            ("PDF files", "*.pdf"),
+            ("Text files", "*.txt;*.md;*.py;*.js;*.html;*.css;*.json")
+        ]
     )
     
     if file_path:
-        # Show loading indicator
-        add_message_to_ui("status", f"Loading PDF: {os.path.basename(file_path)}...")
-        
-        # Extract content in a separate thread to avoid freezing UI
-        def extract_and_update():
-            content = extract_pdf_content(file_path)
+        file_ext = os.path.splitext(file_path)[1].lower()
+        if file_ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
+            # Handle image file
+            global selected_image_path, image_sent_in_history
+            selected_image_path = file_path
+            image_sent_in_history = False
+            update_image_preview(file_path)
+            image_indicator.config(text=f"✓ {os.path.basename(file_path)}")
+        elif file_ext == '.pdf':
+            # Handle PDF file
+            add_message_to_ui("status", f"Loading PDF: {os.path.basename(file_path)}...")
             
-            # Truncate if extremely long
-            if len(content) > 10000:
-                content = content[:10000] + "\n\n[Content truncated due to length. Consider splitting the PDF or selecting fewer pages]"
+            # Extract content in a separate thread to avoid freezing UI
+            def extract_and_update():
+                content = extract_pdf_content(file_path)
+                
+                # Truncate if extremely long
+                if len(content) > 10000:
+                    content = content[:10000] + "\n\n[Content truncated due to length. Consider splitting the PDF or selecting fewer pages]"
+                
+                # Update UI in main thread
+                window.after(0, lambda: update_input_with_pdf_content(content, file_path))
             
-            # Update UI in main thread
-            window.after(0, lambda: update_input_with_pdf_content(content, file_path))
-        
-        thread = threading.Thread(target=extract_and_update, daemon=True)
-        thread.start()
+            thread = threading.Thread(target=extract_and_update, daemon=True)
+            thread.start()
+        elif file_ext in ['.txt', '.md', '.py', '.js', '.html', '.css', '.json']:
+            # Handle text file
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    # Truncate if very long
+                    if len(content) > 10000:
+                        content = content[:10000] + "\n\n[Content truncated due to length]"
+                    user_input_widget.delete("1.0", tk.END)
+                    user_input_widget.insert("1.0", content)
+                add_message_to_ui("status", f"Text loaded from: {os.path.basename(file_path)}")
+            except Exception as e:
+                add_message_to_ui("error", f"Error loading text file: {e}")
 
 def update_input_with_pdf_content(content, file_path):
     """Updates the user input with extracted PDF content."""
@@ -1095,18 +1120,6 @@ def process_stream_queue():
 # ===================
 # UI Helpers
 # ===================
-def select_image():
-    """Opens dialog to select an image file."""
-    global selected_image_path, image_sent_in_history
-    file_path = filedialog.askopenfilename(
-        title="Select Image File",
-        filetypes=[("Image files", "*.png;*.jpg;*.jpeg;*.gif;*.bmp")]
-    )
-    if file_path:
-        selected_image_path = file_path
-        image_sent_in_history = False # Reset flag when new image selected
-        update_image_preview(file_path)
-        image_indicator.config(text=f"✓ {os.path.basename(file_path)}")
 
 def clear_image():
     """Clears the selected image."""
@@ -1469,11 +1482,9 @@ image_preview.dnd_bind('<<Drop>>', handle_image_drop)
 
 img_button_frame = tk.Frame(image_frame)
 img_button_frame.pack(fill=tk.X, pady=2)
-select_button = tk.Button(img_button_frame, text="Image", command=select_image, width=6)
-select_button.pack(side=tk.LEFT, expand=True, padx=2)
-pdf_button = tk.Button(img_button_frame, text="PDF", command=select_pdf, width=6)
-pdf_button.pack(side=tk.LEFT, expand=True, padx=2)
-clear_button = tk.Button(img_button_frame, text="Clear", command=clear_image, width=6)
+select_file_button = tk.Button(img_button_frame, text="Open File", command=select_file, width=8)
+select_file_button.pack(side=tk.LEFT, expand=True, padx=2)
+clear_button = tk.Button(img_button_frame, text="Clear image", command=clear_image, width=6)
 clear_button.pack(side=tk.LEFT, expand=True, padx=2)
 
 image_indicator = tk.Label(image_frame, text="No attachments", font=("Arial", 8, "italic"), fg="grey")
