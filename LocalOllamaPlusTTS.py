@@ -189,6 +189,8 @@ def tts_worker():
                 if tts_voice_id.get():
                     tts_engine.setProperty('voice', tts_voice_id.get())
 
+                tts_engine.setProperty('rate', tts_rate.get())
+
                 # print(f"[TTS Worker] Speaking chunk ({len(text_to_speak)} chars)...")
                 # start_time = time.time()
                 tts_engine.say(text_to_speak)
