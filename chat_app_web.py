@@ -255,70 +255,103 @@ def tts_worker():
     global tts_voice_id_state, tts_rate_state
     print("[TTS Worker] Thread started.")
     while True:
+        text_to_speak = None # Initialize for finally block
         try:
-            text_to_speak = tts_queue.get()
+            text_to_speak = tts_queue.get() # Blocks until item available or None sentinel
             if text_to_speak is None:
                 print("[TTS Worker] Received stop signal.")
                 break
 
             if tts_engine and tts_enabled_state and tts_initialized_successfully:
+                # Set busy flag *before* speaking
                 with tts_busy_lock:
                     tts_busy = True
 
                 try:
                     # Ensure properties are set correctly before speaking
-                    tts_engine.setProperty('voice', tts_voice_id_state)
-                    tts_engine.setProperty('rate', tts_rate_state)
+                    # Re-getting properties every time can be slightly inefficient but safer
+                    current_voice = tts_voice_id_state
+                    current_rate = tts_rate_state
+                    if current_voice:
+                         tts_engine.setProperty('voice', current_voice)
+                    tts_engine.setProperty('rate', current_rate)
 
-                    # print(f"[TTS Worker] Speaking chunk ({len(text_to_speak)} chars)...")
+                    print(f"[TTS Worker] Speaking chunk ({len(text_to_speak)} chars)...") # Log speaking start
                     tts_engine.say(text_to_speak)
-                    tts_engine.runAndWait()
-                    # print(f"[TTS Worker] Finished speaking chunk.")
+                    tts_engine.runAndWait() # Blocks this thread
+                    print(f"[TTS Worker] Finished speaking chunk.") # Log speaking end
 
                 except Exception as speak_err:
                     print(f"[TTS Worker] Error during say/runAndWait: {speak_err}")
-                    # Attempt to recover or just log
-                finally:
-                    with tts_busy_lock:
-                        tts_busy = False
+                    traceback.print_exc()
+                    # Attempt to recover or re-initialize? For now, just log.
+                    # Consider re-initializing TTS engine on certain errors.
+                # *** IMPORTANT: Reset busy flag in finally block ***
+                # finally: # Moved finally block outside inner try
+                #    with tts_busy_lock:
+                #        tts_busy = False
+                # Moved busy flag reset to outer finally block
             else:
                 # print("[TTS Worker] TTS disabled or uninitialized, discarding text.")
                 pass
 
-            tts_queue.task_done()
-        except RuntimeError as rt_err:
-            if "run loop already started" in str(rt_err):
-                print("[TTS Worker] Warning: run loop already started error.")
-                # This might require engine re-initialization in severe cases
-                with tts_busy_lock: tts_busy = False
-            else:
-                print(f"[TTS Worker] Runtime Error: {rt_err}")
-                traceback.print_exc()
-                with tts_busy_lock: tts_busy = False
-        except Exception as e:
-            print(f"[TTS Worker] Unexpected Error: {e}")
+        except RuntimeError as rt_err: # Catch errors in runAndWait or engine state issues
+             if "run loop already started" in str(rt_err):
+                  print("[TTS Worker] Warning: run loop already started error. Attempting recovery.")
+                  # Try stopping and resetting state. This might not always work.
+                  try:
+                       tts_engine.stop()
+                  except: pass
+             else:
+                  print(f"[TTS Worker] Runtime Error: {rt_err}")
+                  traceback.print_exc()
+             # Reset busy state on runtime errors too
+             # with tts_busy_lock: tts_busy = False # Moved to outer finally
+        except Exception as e: # Catch unexpected errors in the loop/queue handling
+            print(f"[TTS Worker] Unexpected Error in worker loop: {e}")
             traceback.print_exc()
-            with tts_busy_lock: tts_busy = False
+            # Reset busy state on general errors
+            # with tts_busy_lock: tts_busy = False # Moved to outer finally
             time.sleep(0.5) # Avoid rapid error loops
+        finally:
+             # *** Ensure busy flag is always reset and task is marked done ***
+             with tts_busy_lock:
+                 tts_busy = False
+             if text_to_speak is not None: # Don't mark done for the None sentinel
+                try:
+                     tts_queue.task_done()
+                except ValueError:
+                     print("[TTS Worker] Warning: task_done() called inappropriately?")
+                     pass # Ignore if task already marked done elsewhere (shouldn't happen)
+
 
     print("[TTS Worker] Thread finished.")
 
 
 def start_tts_thread():
-    """Starts the TTS worker thread if needed."""
+    """Starts the TTS worker thread if needed, checking if already alive."""
     global tts_thread, tts_initialized_successfully
-    if tts_thread is None or not tts_thread.is_alive():
-        # Try to initialize TTS if it hasn't succeeded yet
-        if not tts_initialized_successfully:
-            initialize_tts()
+    if tts_thread is not None and tts_thread.is_alive():
+        print("[TTS] Worker thread is already running.")
+        return # Already running
 
-        # Start thread only if initialization was successful
-        if tts_initialized_successfully:
-            tts_thread = threading.Thread(target=tts_worker, daemon=True)
-            tts_thread.start()
-            print("[TTS] Worker thread started.")
-        else:
-            print("[TTS] Engine init failed previously. Cannot start TTS thread.")
+    # If thread object exists but isn't alive, reset it
+    if tts_thread is not None:
+         print("[TTS] Previous worker thread found but not alive. Clearing reference.")
+         tts_thread = None
+
+    # Try to initialize TTS if it hasn't succeeded yet
+    if not tts_initialized_successfully:
+        initialize_tts()
+
+    # Start thread only if initialization was successful
+    if tts_initialized_successfully:
+        print("[TTS] Starting new worker thread...")
+        tts_thread = threading.Thread(target=tts_worker, daemon=True)
+        tts_thread.start()
+        print("[TTS] Worker thread started.")
+    else:
+        print("[TTS] Engine init failed previously. Cannot start TTS thread.")
 
 
 def stop_tts_thread():
@@ -356,6 +389,12 @@ def toggle_tts(enable):
     global tts_initialized_successfully # Check initialization status
 
     if enable:
+        # *** ADD Check: Ensure worker thread is running ***
+        if tts_initialized_successfully and (tts_thread is None or not tts_thread.is_alive()):
+            print("[TTS Toggle] Worker thread not running, attempting to start...")
+            start_tts_thread() # Try starting it
+        # *** END Check ***
+
         if not tts_initialized_successfully:
              print("[TTS Toggle] Attempting to initialize TTS on enable...")
              initialize_tts() # Try again
@@ -363,7 +402,7 @@ def toggle_tts(enable):
         if tts_initialized_successfully:
             tts_enabled_state = True
             print("[TTS] Enabled by API request.")
-            start_tts_thread() # Ensure worker is running
+            start_tts_thread() # Ensure worker is running (redundant call is okay)
             send_status_to_web("TTS Enabled.")
             return True
         else:
@@ -382,7 +421,7 @@ def toggle_tts(enable):
         while not tts_queue.empty():
             try: tts_queue.get_nowait()
             except queue.Empty: break
-        # Optionally stop the thread to save resources: stop_tts_thread()
+        # Optional: Stop the thread to save resources: stop_tts_thread()
         send_status_to_web("TTS Disabled.")
         return True
 
@@ -1384,11 +1423,12 @@ def create_flask_app():
         global selected_file_path, selected_file_type, file_processed_for_input
 
         if stream_in_progress:
-            return jsonify({"status": "error", "message": "Please wait for the previous response."}), 429 # Too Many Requests
+            return jsonify({"status": "error", "message": "Please wait for the previous response."}), 429
 
         user_text = request.form.get('message', '').strip()
         file = request.files.get('file')
         file_content_for_input = None
+        processed_filename = None # Keep track of the processed filename for header
 
         # --- File Handling ---
         if file and file.filename:
@@ -1398,43 +1438,45 @@ def create_flask_app():
                 try:
                     file.save(temp_save_path)
                     print(f"[API Send] File '{filename}' uploaded and saved to {temp_save_path}")
+                    processed_filename = filename # Store original filename for context
                     # Process the saved file (determines type, extracts content if applicable)
                     file_content_for_input = process_uploaded_file(temp_save_path)
-                    # If processing failed, selected_file_path/type will be None
                     if selected_file_path is None:
                         return jsonify({"status": "error", "message": f"Failed to process or unsupported file type: {filename}"}), 400
-
                 except Exception as e:
                     print(f"[API Send] Error saving or processing upload '{filename}': {e}")
                     return jsonify({"status": "error", "message": f"Error handling uploaded file: {e}"}), 500
             else:
                 return jsonify({"status": "error", "message": f"File type not allowed: {file.filename}"}), 400
         else:
-             # Clear any previous file selection if no new file is uploaded
-             # selected_file_path = None
-             # selected_file_type = None
-             # file_processed_for_input = False
-             pass # Keep existing selection if no new file provided? Depends on desired UX. Let's clear it.
-             if not request.form.get('keep_attachment'): # Add a flag from frontend if needed
+             if not request.form.get('keep_attachment'): # Only clear if not explicitly keeping
                  selected_file_path = None
                  selected_file_type = None
                  file_processed_for_input = False
 
 
-        # --- Message Content Preparation ---
+        # --- Message Content Preparation (FIX FOR PDF/TEXT) ---
         final_user_text = user_text
-        # Option 1: Prepend extracted content automatically
-        # if file_content_for_input:
-        #     final_user_text = f"--- Content from {selected_file_type}: {os.path.basename(selected_file_path)} ---\n{file_content_for_input}\n\n---\n\n{user_text}"
+        # Prepend extracted content if it exists (PDF/Text)
+        if file_content_for_input and selected_file_type in ['pdf', 'text']:
+             file_header = f"--- Content from {selected_file_type.upper()}: {processed_filename} ---\n"
+             file_footer = f"\n--- End of {processed_filename} Content ---"
+             # If user also typed text, combine them clearly
+             if user_text:
+                   final_user_text = f"{file_header}{file_content_for_input}{file_footer}\n\n{user_text}"
+             else: # Only file content provided
+                  final_user_text = f"{file_header}{file_content_for_input}{file_footer}"
+             print(f"[API Send] Prepended content from {processed_filename}")
 
-        # Option 2: Assume frontend handles placing content in the message box if desired.
-        # Backend just needs to know *if* a file (especially image) is attached.
+        # --- Validation after potential prepending ---
+        if not final_user_text and not (selected_file_path and selected_file_type == 'image'):
+             # Allow sending just an image, otherwise require text/file content
+             return jsonify({"status": "error", "message": "Please enter a message or attach a processable file."}), 400
 
-        if not final_user_text and not selected_file_path:
-             return jsonify({"status": "error", "message": "Please enter a message or attach a file."}), 400
 
         # --- Start Chat ---
-        run_chat_interaction(final_user_text) # Handles Ollama call, history, TTS stop etc.
+        # Pass the potentially combined text to the chat interaction
+        run_chat_interaction(final_user_text)
 
         return jsonify({"status": "success", "message": "Message received, processing..."})
 

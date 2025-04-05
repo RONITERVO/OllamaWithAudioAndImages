@@ -701,11 +701,30 @@
                 populateDropdown(ttsVoiceSelect, (voices || []).map(v => ({ value: v.id, text: v.name })), currentVoiceId);
             });
 
+            // *** FIX FOR PROBLEM 1 (Voice Input) ***
             eventSource.addEventListener('transcription', (event) => {
                 const transData = JSON.parse(event.data);
                 console.log("SSE: Transcription:", transData);
-                addMessage('transcription', `🎤 Detected (${transData.language || 'auto'}): ${transData.text || ''}`);
-                // Optionally auto-send? No, keep it simple.
+                const transcriptionText = transData.text || '';
+                // Add transcription to chat history for visibility
+                addMessage('transcription', `🎤 Detected (${transData.language || 'auto'}): ${transcriptionText}`);
+
+                // *** Add the transcription to the input box ***
+                if (transcriptionText) {
+                    const currentInput = messageInput.value;
+                    if (currentInput && !currentInput.endsWith(' ')) {
+                        messageInput.value += ' '; // Add space if needed
+                    }
+                    messageInput.value += transcriptionText;
+                    updateTextareaHeight(); // Adjust height after adding text
+                    messageInput.focus(); // Focus input box
+                    // Move cursor to the end
+                    messageInput.selectionStart = messageInput.selectionEnd = messageInput.value.length;
+                }
+                // Optional: Implement auto-send toggle here if desired
+                // if (document.getElementById('auto-send-checkbox').checked) { // Assuming checkbox exists
+                //    sendMessageToServer();
+                // }
             });
 
             eventSource.addEventListener('full_status', (event) => {
