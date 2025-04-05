@@ -1,7 +1,4 @@
 import ollama
-import tkinter as tk
-from tkinter import filedialog, scrolledtext, ttk
-from PIL import Image, ImageTk
 import pyttsx3
 import threading
 import queue
@@ -15,76 +12,76 @@ import numpy as np
 import tempfile
 import os
 import torch
-import torchaudio
+# import torchaudio # Not strictly needed for VAD/Whisper processing here
 from collections import deque
 import traceback
-import fitz
-from tkinterdnd2 import TkinterDnD, DND_FILES
-
-# --- Flask Imports (Phase 1) ---
-from flask import Flask, request, jsonify, render_template, Response
+import fitz # For PDF processing
 import json
 import sys
+import mimetypes # For checking file types
 
+# --- Flask Imports ---
+from flask import Flask, request, jsonify, render_template, Response, send_from_directory
+from werkzeug.utils import secure_filename
 
 # ===================
 # Constants
 # ===================
 # --- Audio ---
-CHUNK = 1024            # Audio frames per buffer
-VAD_CHUNK = 512         # Smaller chunk for VAD responsiveness
-RATE = 16000            # Sampling rate (must be 16 kHz for Silero VAD & good for Whisper)
+CHUNK = 1024
+VAD_CHUNK = 512
+RATE = 16000
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-SILENCE_THRESHOLD_SECONDS = 1.0 # How long silence triggers end of recording
-MIN_SPEECH_DURATION_SECONDS = 0.2 # Ignore very short bursts
-PRE_SPEECH_BUFFER_SECONDS = 0.3 # Keep audio before speech starts
-
-# --- UI ---
-APP_TITLE = "Ollama Multimodal Chat++ (Streaming, TTS, VAD) + Web UI"
-WINDOW_GEOMETRY = "850x850"
+SILENCE_THRESHOLD_SECONDS = 1.0
+MIN_SPEECH_DURATION_SECONDS = 0.3 # Slightly longer minimum to reduce noise triggers
+PRE_SPEECH_BUFFER_SECONDS = 0.3
 
 # --- Models ---
 DEFAULT_OLLAMA_MODEL = "gemma3:27b"
-DEFAULT_WHISPER_MODEL_SIZE = "turbo-large" # Faster startup, change to 'medium' or 'large' for better accuracy
+DEFAULT_WHISPER_MODEL_SIZE = "turbo-large" # Defaulting to medium for better balance
 
 # --- Whisper ---
-WHISPER_LANGUAGES = [
-    ("Auto Detect", None), ("English", "en"), ("Finnish", "fi"), ("Swedish", "sv"),
-    ("German", "de"), ("French", "fr"), ("Spanish", "es"), ("Italian", "it"),
-    ("Russian", "ru"), ("Chinese", "zh"), ("Japanese", "ja")
-]
+# Keep language codes, names are for UI display (handled in frontend if needed)
+WHISPER_LANGUAGES = {
+    "Auto Detect": None, "English": "en", "Finnish": "fi", "Swedish": "sv",
+    "German": "de", "French": "fr", "Spanish": "es", "Italian": "it",
+    "Russian": "ru", "Chinese": "zh", "Japanese": "ja"
+}
 WHISPER_MODEL_SIZES = ["tiny", "base", "small", "medium", "large", "turbo-tiny", "turbo-base", "turbo-small", "turbo-medium", "turbo-large"]
 
 # --- Web Server ---
 FLASK_PORT = 5000
 FLASK_HOST = "0.0.0.0" # Accessible on local network
+UPLOAD_FOLDER = 'uploads' # Temporary folder for uploads
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'pdf', 'txt', 'md', 'py', 'js', 'html', 'css', 'json', 'log', 'csv', 'xml', 'yaml', 'ini', 'sh', 'bat'}
 
 # ===================
-# Globals
+# Globals / Backend State
 # ===================
 # --- Ollama & Chat ---
 messages = []
-messages_lock = threading.Lock() # (Phase 2) Lock for shared access
-selected_image_path = ""
-image_sent_in_history = False
+messages_lock = threading.Lock()
+selected_file_path = None # Store path of the currently attached file
+selected_file_type = None # Store type ('image', 'pdf', 'text')
+file_processed_for_input = False # Flag if PDF/Text was loaded into input already
 current_model = DEFAULT_OLLAMA_MODEL
-stream_queue = queue.Queue()
-stream_done_event = threading.Event()
 stream_in_progress = False
-chat_history_widget = None # Assign after Tkinter setup
+ollama_lock = threading.Lock() # Lock for sending messages to ollama
 
 # --- TTS ---
 tts_engine = None
 tts_queue = queue.Queue()
 tts_thread = None
 tts_sentence_buffer = ""
-tts_enabled = None      # tk.BooleanVar
-tts_rate = None         # tk.IntVar
-tts_voice_id = None     # tk.StringVar
+tts_enabled_state = True # Default TTS state
+tts_rate_state = 160 # Default rate
+tts_voice_id_state = "" # Default voice ID
+tts_available_voices = [] # Store available voices (id, name)
 tts_busy = False
 tts_busy_lock = threading.Lock()
 tts_initialized_successfully = False
+tts_init_lock = threading.Lock() # Lock for TTS initialization
 
 # --- Whisper/VAD ---
 vad_model = None
@@ -98,310 +95,240 @@ vad_thread = None
 vad_stop_event = threading.Event()
 whisper_queue = queue.Queue() # Queue for audio filenames to transcribe
 whisper_processing_thread = None
-whisper_language = None     # Set via UI, default None (auto)
-voice_enabled = None        # tk.BooleanVar
-recording_indicator_widget = None # Assign after Tkinter setup
-auto_send_after_transcription = None
-user_input_widget = None    # Assign after Tkinter setup
+whisper_language_state = None # Default 'Auto Detect'
+voice_enabled_state = True # Default VAD state
+vad_status = {"text": "Voice Disabled", "color": "grey"} # Current VAD status for SSE
+vad_status_lock = threading.Lock()
 
 # --- Audio Handling ---
 py_audio = None
-audio_stream = None
-is_recording_for_whisper = False # State flag for VAD-triggered recording
-audio_frames_buffer = deque() # Holds raw audio data during VAD recording
-vad_audio_buffer = deque(maxlen=int(RATE / VAD_CHUNK * 1.5)) # Rolling buffer for VAD analysis (~1.5 sec)
-temp_audio_file_path = None # Path for the temporary WAV file
+is_recording_for_whisper = False
+audio_frames_buffer = deque()
+vad_audio_buffer = deque(maxlen=int(RATE / VAD_CHUNK * 1.5))
+temp_audio_file_path = None # Path for the VAD temporary WAV file
 
-# --- Web Interface Communication (Phase 1) ---
-web_input_queue = queue.Queue() # Messages from Web UI -> Main App Logic
-web_output_queue = queue.Queue() # Stream chunks from Ollama -> Web UI (SSE)
-flask_thread = None # Holder for the Flask thread
+# --- Web Communication ---
+web_output_queue = queue.Queue() # SSE Queue for Ollama chunks, status updates, errors
+flask_app = None # Holder for the Flask app instance
 
+# ============================================================================
+# Utility Functions
+# ============================================================================
 
-# ===================
-# Flask Web Server (Phase 1 & 2)
-# ===================
-app = Flask(__name__)
+def get_vad_status():
+    """Safely get the current VAD status."""
+    with vad_status_lock:
+        return vad_status.copy()
 
-# --- Routes ---
-@app.route('/')
-def index():
-    """Serves the main HTML page."""
-    # (Phase 3) Serve the HTML file
-    return render_template('index.html')
+def update_vad_status(text, color):
+    """Safely updates the VAD status and pushes update to SSE queue."""
+    global vad_status
+    # print(f"[Status Update] VAD: {text} ({color})") # Debug VAD status changes
+    with vad_status_lock:
+        if vad_status["text"] != text or vad_status["color"] != color:
+            vad_status = {"text": text, "color": color}
+            # Push update to web clients via SSE queue
+            web_output_queue.put({"type": "status_update", "source": "vad", "data": vad_status})
 
-@app.route('/send_message', methods=['POST'])
-def handle_send_message():
-    """Receives message from web UI and queues it."""
-    # (Phase 2) Implementation
-    data = request.get_json()
-    user_text = data.get('message', '').strip()
-    # Optional: Handle image data (more complex, start with text)
-    if user_text:
-        print(f"[Web] Received message via web: '{user_text}'")
-        # Put the message onto the queue for the main thread to process
-        web_input_queue.put({"type": "text_message", "content": user_text})
-        return jsonify({"status": "success", "message": "Message queued"})
-    else:
-        return jsonify({"status": "error", "message": "Empty message received"}), 400
+def send_error_to_web(error_message):
+    """Sends an error message to the web UI via SSE."""
+    print(f"[Web Error] {error_message}")
+    web_output_queue.put({"type": "error", "data": str(error_message)})
 
-@app.route('/get_history')
-def handle_get_history():
-    """Returns the chat history (thread-safe)."""
-    # (Phase 2) Implementation
-    global messages, messages_lock
-    history_copy = []
-    try:
-        with messages_lock: # Protect read access
-            for msg in messages:
-                msg_copy = msg.copy()
-                # Ensure image data (bytes) isn't sent, replace or omit it
-                if "images" in msg_copy:
-                    # Represent image presence without sending bytes
-                    if msg_copy.get("content"):
-                         msg_copy["content"] += " [Image Attachment]"
-                    else:
-                         msg_copy["content"] = "[Image Attachment]"
-                    del msg_copy["images"] # Don't send raw bytes over JSON
-                history_copy.append(msg_copy)
-    except Exception as e:
-        print(f"[Web History] Error accessing messages: {e}")
-        return jsonify({"error": "Failed to retrieve history"}), 500
-    return jsonify({"history": history_copy})
+def send_status_to_web(status_message):
+    """Sends a general status message to the web UI via SSE."""
+    print(f"[Web Status] {status_message}")
+    web_output_queue.put({"type": "status", "data": str(status_message)})
 
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-@app.route('/stream')
-def handle_stream():
-    """Streams Ollama responses using Server-Sent Events (SSE)."""
-    # (Phase 2) Implementation
-    def event_stream():
-        print("[Web SSE] Client connected to stream.")
-        last_event_time = time.time()
-        try:
-            while True:
-                # Wait for a new message from the Ollama worker via the queue
-                try:
-                    # Block for a short time, then send keepalive if nothing
-                    data = web_output_queue.get(timeout=10) # Wait up to 10s
+# ============================================================================
+# TTS Logic (Mostly unchanged, interacts with state variables)
+# ============================================================================
 
-                    if data.get("type") == "chunk":
-                        yield f"event: message\ndata: {json.dumps(data)}\n\n"
-                    elif data.get("type") == "end":
-                        yield f"event: end\ndata: {json.dumps(data)}\n\n"
-                        # Keep listening for next response
-                    elif data.get("type") == "error":
-                        yield f"event: error\ndata: {json.dumps(data)}\n\n"
-
-                    web_output_queue.task_done() # Mark item as processed
-                    last_event_time = time.time()
-
-                except queue.Empty:
-                    # Send a keepalive comment if queue is empty after timeout
-                    if time.time() - last_event_time > 15: # Send keepalive every ~15s of inactivity
-                         # print("[Web SSE] Sending keepalive.")
-                         yield ": keepalive\n\n"
-                         last_event_time = time.time() # Reset timer after keepalive
-                    else:
-                         time.sleep(0.1) # Small sleep if queue was checked recently but empty
-
-                except GeneratorExit:
-                    print("[Web SSE] Client disconnected.")
-                    break # Exit loop if client disconnects
-                except Exception as e:
-                    print(f"[Web SSE] Error in stream loop: {e}")
-                    # Yield error to client if possible
-                    try:
-                         yield f"event: error\ndata: {json.dumps({'type': 'error', 'content': f'SSE internal error: {e}'})}\n\n"
-                    except Exception as notify_e:
-                         print(f"[Web SSE] Could not notify client of error: {notify_e}")
-                    time.sleep(1) # Avoid rapid error loops
-
-        finally:
-            print("[Web SSE] Stopping event stream generator for a client.")
-            # Clean up if necessary
-    return Response(event_stream(), mimetype="text/event-stream")
-
-# --- Flask Runner ---
-def run_flask():
-    """Function to run the Flask app in a thread."""
-    print(f"[Web] Starting Flask server on http://{FLASK_HOST}:{FLASK_PORT}")
-    print(f"[Web] Access the UI from another device on your network via: http://<YOUR_PC_IP>:{FLASK_PORT}")
-    try:
-        # Use 'allow_unsafe_werkzeug=True' only if developing and need reloader with threading issues
-        # For production or safer development with threads, debug=False is recommended.
-        app.run(host=FLASK_HOST, port=FLASK_PORT, threaded=True, debug=False)
-    except Exception as e:
-        print(f"[Web] Flask server failed to start: {e}")
-        # Optionally, try to signal main thread about the failure if needed
-        # web_output_queue.put({"type": "error", "content": "Flask server failed"})
-
-
-# ===================
-# TTS Setup & Control (No changes needed for basic web integration)
-# ===================
 def initialize_tts():
     """Initializes the TTS engine. Returns True on success."""
-    global tts_engine, tts_initialized_successfully, tts_rate, tts_voice_id
-    if tts_engine: return True # Already initialized
+    global tts_engine, tts_initialized_successfully, tts_rate_state, tts_voice_id_state, tts_available_voices
 
-    try:
-        print("[TTS] Initializing engine...")
-        tts_engine = pyttsx3.init()
-        if not tts_engine: raise Exception("pyttsx3.init() returned None")
+    with tts_init_lock:
+        if tts_initialized_successfully:
+            return True # Already initialized successfully
 
-        tts_engine.setProperty('rate', tts_rate.get())
-        tts_engine.setProperty('volume', 0.9)
-        if tts_voice_id.get():
-            tts_engine.setProperty('voice', tts_voice_id.get())
+        if tts_engine: # Cleanup old engine if retry needed
+             try:
+                  del tts_engine
+                  tts_engine = None
+             except: pass
 
-        tts_initialized_successfully = True
-        print("[TTS] Engine initialized successfully.")
-        return True
-    except Exception as e:
-        print(f"[TTS] Error initializing engine: {e}")
-        tts_engine = None
-        tts_initialized_successfully = False
-        return False
+        try:
+            print("[TTS] Initializing engine...")
+            tts_engine = pyttsx3.init()
+            if not tts_engine: raise Exception("pyttsx3.init() returned None")
+
+            # Set initial properties from state variables
+            tts_engine.setProperty('rate', tts_rate_state)
+            tts_engine.setProperty('volume', 0.9)
+            if tts_voice_id_state:
+                tts_engine.setProperty('voice', tts_voice_id_state)
+
+            # Get and store available voices
+            voices = tts_engine.getProperty('voices')
+            tts_available_voices = [{"id": v.id, "name": v.name} for v in voices]
+            if not tts_voice_id_state and tts_available_voices: # Set a default voice if none was set
+                tts_voice_id_state = tts_available_voices[0]['id']
+                tts_engine.setProperty('voice', tts_voice_id_state)
+
+            tts_initialized_successfully = True
+            print(f"[TTS] Engine initialized successfully. Default Voice: {tts_voice_id_state}")
+            send_status_to_web("TTS Engine Ready.")
+            # Send updated voice list via SSE
+            web_output_queue.put({"type": "voices_update", "data": tts_available_voices})
+            return True
+        except Exception as e:
+            print(f"[TTS] Error initializing engine: {e}")
+            traceback.print_exc()
+            tts_engine = None
+            tts_initialized_successfully = False
+            tts_available_voices = []
+            send_error_to_web(f"TTS Initialization Failed: {e}")
+            return False
 
 def get_available_voices():
-    """Returns a list of available TTS voices (name, id)."""
-    temp_engine = None
-    try:
-        temp_engine = pyttsx3.init()
-        if not temp_engine: return []
-        voices = temp_engine.getProperty('voices')
-        voice_list = [(v.name[:30] + "..." if len(v.name) > 30 else v.name, v.id) for v in voices]
-        temp_engine.stop()
-        del temp_engine # Ensure release
-        return voice_list
-    except Exception as e:
-        print(f"[TTS] Error getting voices: {e}")
-        if temp_engine:
-            try: temp_engine.stop()
-            except: pass
-            del temp_engine
-        return []
+    """Returns the cached list of available TTS voices."""
+    global tts_available_voices
+    if not tts_initialized_successfully:
+        initialize_tts() # Attempt to initialize if not already done
+    return tts_available_voices
 
-def set_voice(event=None):
-    """Sets the selected voice for the TTS engine."""
-    global tts_engine, tts_voice_id, tts_initialized_successfully
-    if not tts_initialized_successfully or not tts_engine: return
+def set_tts_voice(voice_id):
+    """Sets the selected voice ID for TTS."""
+    global tts_voice_id_state, tts_engine, tts_initialized_successfully
+    if not tts_initialized_successfully:
+        send_error_to_web("TTS not initialized, cannot set voice.")
+        return False
     try:
-        # Ensure voice_selector exists and has a valid selection
-        if 'voice_selector' in globals() and hasattr(voice_selector, 'current'):
-            selected_idx = voice_selector.current()
-            if selected_idx >= 0 and 'available_voices' in globals() and selected_idx < len(available_voices):
-                voice_id = available_voices[selected_idx][1]
-                tts_voice_id.set(voice_id)
+        # Validate if voice_id exists (optional but good practice)
+        if any(v['id'] == voice_id for v in tts_available_voices):
+            tts_voice_id_state = voice_id
+            # Set property on engine if it exists
+            if tts_engine:
                 tts_engine.setProperty('voice', voice_id)
-                print(f"[TTS] Voice set to: {available_voices[selected_idx][0]}")
-            else:
-                print(f"[TTS] Invalid voice selection index: {selected_idx}")
+            print(f"[TTS] Voice set to ID: {voice_id}")
+            return True
         else:
-            print("[TTS] Voice selector not ready for setting voice.")
+            print(f"[TTS] Error: Voice ID '{voice_id}' not found.")
+            send_error_to_web(f"Invalid TTS Voice ID: {voice_id}")
+            return False
     except Exception as e:
         print(f"[TTS] Error setting voice: {e}")
+        send_error_to_web(f"Error setting TTS voice: {e}")
+        return False
 
-
-def set_speech_rate(value=None): # Updated to accept value from scale command
-    """Sets the speech rate for the TTS engine."""
-    global tts_engine, tts_rate, tts_initialized_successfully
-    if not tts_initialized_successfully or not tts_engine: return
+def set_tts_rate(rate):
+    """Sets the speech rate for TTS."""
+    global tts_rate_state, tts_engine, tts_initialized_successfully
+    if not tts_initialized_successfully:
+        send_error_to_web("TTS not initialized, cannot set rate.")
+        return False
     try:
-        rate = int(float(value))
-        tts_rate.set(rate)
-        tts_engine.setProperty('rate', rate)
-        # print(f"[TTS] Speech rate set to: {rate}") # Optional: Can be noisy
+        rate = int(rate)
+        if 80 <= rate <= 400: # Basic range validation
+            tts_rate_state = rate
+            if tts_engine:
+                tts_engine.setProperty('rate', rate)
+            # print(f"[TTS] Rate set to: {rate}") # Can be noisy
+            return True
+        else:
+            print(f"[TTS] Error: Rate {rate} out of range (80-400).")
+            send_error_to_web(f"Invalid TTS Rate: {rate}. Must be between 80 and 400.")
+            return False
     except Exception as e:
-        print(f"[TTS] Error setting speech rate: {e}")
+        print(f"[TTS] Error setting rate: {e}")
+        send_error_to_web(f"Error setting TTS rate: {e}")
+        return False
 
 def tts_worker():
     """Worker thread processing the TTS queue."""
-    global tts_engine, tts_queue, tts_busy, tts_initialized_successfully, tts_rate, tts_voice_id
+    global tts_engine, tts_queue, tts_busy, tts_initialized_successfully, tts_enabled_state
+    global tts_voice_id_state, tts_rate_state
     print("[TTS Worker] Thread started.")
     while True:
         try:
-            text_to_speak = tts_queue.get() # Blocks until item available
-            if text_to_speak is None: # Sentinel for stopping
+            text_to_speak = tts_queue.get()
+            if text_to_speak is None:
                 print("[TTS Worker] Received stop signal.")
                 break
 
-            if tts_engine and tts_enabled.get() and tts_initialized_successfully:
+            if tts_engine and tts_enabled_state and tts_initialized_successfully:
                 with tts_busy_lock:
                     tts_busy = True
 
-                # Refresh voice and rate settings before each say() call
                 try:
-                    current_voice = tts_voice_id.get()
-                    if current_voice:
-                        tts_engine.setProperty('voice', current_voice)
-                    tts_engine.setProperty('rate', tts_rate.get())
-                except Exception as prop_err:
-                    print(f"[TTS Worker] Error setting properties: {prop_err}")
-                    # Decide if we should continue or skip this utterance
-                    with tts_busy_lock: tts_busy = False
-                    tts_queue.task_done()
-                    continue # Skip this utterance
+                    # Ensure properties are set correctly before speaking
+                    tts_engine.setProperty('voice', tts_voice_id_state)
+                    tts_engine.setProperty('rate', tts_rate_state)
 
-                # print(f"[TTS Worker] Speaking chunk ({len(text_to_speak)} chars)...")
-                # start_time = time.time()
-                tts_engine.say(text_to_speak)
-                tts_engine.runAndWait() # This blocks the worker, not the main thread
-                # print(f"[TTS Worker] Finished in {time.time() - start_time:.2f}s")
+                    # print(f"[TTS Worker] Speaking chunk ({len(text_to_speak)} chars)...")
+                    tts_engine.say(text_to_speak)
+                    tts_engine.runAndWait()
+                    # print(f"[TTS Worker] Finished speaking chunk.")
 
-                with tts_busy_lock:
-                    tts_busy = False
+                except Exception as speak_err:
+                    print(f"[TTS Worker] Error during say/runAndWait: {speak_err}")
+                    # Attempt to recover or just log
+                finally:
+                    with tts_busy_lock:
+                        tts_busy = False
             else:
-                # print("[TTS Worker] Engine disabled or uninitialized, discarding text.")
-                pass # Just discard
+                # print("[TTS Worker] TTS disabled or uninitialized, discarding text.")
+                pass
 
-            tts_queue.task_done() # Mark task as complete
+            tts_queue.task_done()
         except RuntimeError as rt_err:
-             if "run loop already started" in str(rt_err):
-                  print("[TTS Worker] Warning: run loop already started, skipping runAndWait().")
-                  # This might happen if runAndWait was interrupted abruptly before.
-                  # Reset busy state carefully.
-                  with tts_busy_lock: tts_busy = False
-             else:
-                  print(f"[TTS Worker] Runtime Error: {rt_err}")
-                  traceback.print_exc()
-                  with tts_busy_lock: tts_busy = False
+            if "run loop already started" in str(rt_err):
+                print("[TTS Worker] Warning: run loop already started error.")
+                # This might require engine re-initialization in severe cases
+                with tts_busy_lock: tts_busy = False
+            else:
+                print(f"[TTS Worker] Runtime Error: {rt_err}")
+                traceback.print_exc()
+                with tts_busy_lock: tts_busy = False
         except Exception as e:
             print(f"[TTS Worker] Unexpected Error: {e}")
             traceback.print_exc()
-            with tts_busy_lock: # Ensure busy flag is reset on error
-                tts_busy = False
-            # Consider adding a small sleep to prevent rapid error looping
-            time.sleep(0.5)
+            with tts_busy_lock: tts_busy = False
+            time.sleep(0.5) # Avoid rapid error loops
 
     print("[TTS Worker] Thread finished.")
+
 
 def start_tts_thread():
     """Starts the TTS worker thread if needed."""
     global tts_thread, tts_initialized_successfully
     if tts_thread is None or not tts_thread.is_alive():
+        # Try to initialize TTS if it hasn't succeeded yet
         if not tts_initialized_successfully:
-            tts_initialized_successfully = initialize_tts() # Attempt init again
+            initialize_tts()
 
+        # Start thread only if initialization was successful
         if tts_initialized_successfully:
             tts_thread = threading.Thread(target=tts_worker, daemon=True)
             tts_thread.start()
             print("[TTS] Worker thread started.")
         else:
-            print("[TTS] Engine init failed. Cannot start TTS thread.")
-            # Update UI to reflect failure (handled in toggle_tts)
+            print("[TTS] Engine init failed previously. Cannot start TTS thread.")
+
 
 def stop_tts_thread():
     """Signals the TTS worker thread to stop and cleans up."""
     global tts_thread, tts_engine, tts_queue, tts_busy, tts_busy_lock
     print("[TTS] Stopping worker thread...")
-    if tts_engine:
+    if tts_engine and tts_initialized_successfully:
         try:
-            # Attempt to stop speaking immediately
             tts_engine.stop()
             print("[TTS] Engine stop requested.")
-            # Try to cleanly interrupt runAndWait if it's blocking
-            # Unfortunately, pyttsx3 doesn't offer a reliable non-blocking API or interruption mechanism easily.
         except Exception as e:
              print(f"[TTS] Error stopping engine: {e}")
 
@@ -411,125 +338,105 @@ def stop_tts_thread():
         except queue.Empty: break
     print("[TTS] Queue cleared.")
 
-    # Signal thread to stop and wait
     if tts_thread and tts_thread.is_alive():
         tts_queue.put(None) # Send sentinel
         print("[TTS] Waiting for worker thread to join...")
-        tts_thread.join(timeout=3) # Increased timeout
+        tts_thread.join(timeout=2.5)
         if tts_thread.is_alive():
-            print("[TTS] Warning: Worker thread did not terminate gracefully after 3s.")
+            print("[TTS] Warning: Worker thread did not terminate gracefully.")
         else:
              print("[TTS] Worker thread joined.")
     tts_thread = None
-    # Reset busy state just in case
     with tts_busy_lock: tts_busy = False
+    print("[TTS] Worker thread stopped.")
 
+def toggle_tts(enable):
+    """Handles enabling/disabling TTS via API."""
+    global tts_enabled_state, tts_sentence_buffer
+    global tts_initialized_successfully # Check initialization status
 
-def toggle_tts():
-    """Callback for the TTS enable/disable checkbox."""
-    global tts_enabled, tts_sentence_buffer, tts_initialized_successfully, voice_selector, rate_scale
-    if tts_enabled.get():
+    if enable:
         if not tts_initialized_successfully:
-            # Try initializing again when toggled on
-            tts_initialized_successfully = initialize_tts()
+             print("[TTS Toggle] Attempting to initialize TTS on enable...")
+             initialize_tts() # Try again
 
         if tts_initialized_successfully:
-            print("[TTS] Enabled by user.")
-            start_tts_thread() # Ensure thread is running
-            # Enable controls if they were disabled
-            if 'voice_selector' in globals() and voice_selector: voice_selector.config(state="readonly")
-            if 'rate_scale' in globals() and rate_scale: rate_scale.config(state="normal")
+            tts_enabled_state = True
+            print("[TTS] Enabled by API request.")
+            start_tts_thread() # Ensure worker is running
+            send_status_to_web("TTS Enabled.")
+            return True
         else:
+            tts_enabled_state = False # Ensure state is false if init failed
             print("[TTS] Enable failed - Engine initialization problem.")
-            tts_enabled.set(False) # Uncheck the box
-            add_message_to_ui("error", "TTS Engine failed to initialize. Cannot enable TTS.")
-            # Ensure controls are disabled
-            if 'voice_selector' in globals() and voice_selector: voice_selector.config(state="disabled")
-            if 'rate_scale' in globals() and rate_scale: rate_scale.config(state="disabled")
+            send_error_to_web("TTS Engine failed to initialize. Cannot enable TTS.")
+            return False
     else:
-        print("[TTS] Disabled by user.")
+        tts_enabled_state = False
+        print("[TTS] Disabled by API request.")
         # Stop speaking and clear buffer/queue immediately
-        if tts_engine:
-            try:
-                 tts_engine.stop()
-                 # Clear any pending commands in the engine's internal queue (if possible)
-                 # This is often needed if runAndWait is blocking
+        if tts_engine and tts_initialized_successfully:
+            try: tts_engine.stop()
             except Exception as e: print(f"[TTS] Error stopping on toggle off: {e}")
         tts_sentence_buffer = ""
         while not tts_queue.empty():
             try: tts_queue.get_nowait()
             except queue.Empty: break
-        # Optional: Stop the worker thread if you want to save resources when disabled
-        # stop_tts_thread() # Consider if needed, starting/stopping threads frequently can add overhead
+        # Optionally stop the thread to save resources: stop_tts_thread()
+        send_status_to_web("TTS Disabled.")
+        return True
 
 
 def queue_tts_text(new_text):
     """Accumulates text for TTS, intended to be flushed later."""
-    global tts_sentence_buffer
-    if tts_enabled.get() and tts_initialized_successfully:
+    global tts_sentence_buffer, tts_enabled_state, tts_initialized_successfully
+    if tts_enabled_state and tts_initialized_successfully:
         tts_sentence_buffer += new_text
 
 def try_flush_tts_buffer():
     """Sends complete sentences from the buffer to the TTS queue if TTS is idle."""
     global tts_sentence_buffer, tts_busy, tts_queue, tts_busy_lock
-    if not tts_enabled.get() or not tts_initialized_successfully or not tts_engine:
+    global tts_enabled_state, tts_initialized_successfully
+
+    if not tts_enabled_state or not tts_initialized_successfully:
         tts_sentence_buffer = "" # Clear buffer if TTS is off
         return
 
-    # Use the lock to check if TTS is currently processing a previous chunk
     with tts_busy_lock:
         if tts_busy:
-             # print("[TTS Flush] Engine busy, delaying flush.")
              return # Don't queue new text if already speaking
 
-    # Check if there's anything substantial to process
     if not tts_sentence_buffer or tts_sentence_buffer.isspace():
          return
 
-    # Split on sentence endings (. ! ? \n) followed by space or end of string
-    # Keep delimiters attached to the preceding sentence part.
-    # Handle potential multiple delimiters like "..." or "?!" correctly.
+    # Split logic remains the same
     sentences = re.split(r'([.!?\n]+(?:\s+|$))', tts_sentence_buffer)
-
-    # Filter out empty strings that can result from splitting
     sentences = [s for s in sentences if s]
 
     chunk_to_speak = ""
     processed_len = 0
     temp_buffer = []
-
-    # Process pairs of (sentence_part, delimiter_part) if available
-    # Or just single parts if the split resulted in odd number of elements
     i = 0
     while i < len(sentences):
         sentence_part = sentences[i]
         delimiter_part = ""
-        # Check if the next element looks like a delimiter part
         if (i + 1) < len(sentences) and re.match(r'^([.!?\n]+(?:\s+|$))', sentences[i+1]):
              delimiter_part = sentences[i+1]
-             # Found a complete sentence segment
              temp_buffer.append(sentence_part + delimiter_part)
              processed_len += len(sentence_part + delimiter_part)
-             i += 2 # Move past sentence and delimiter
+             i += 2
         else:
-             # This part doesn't have a delimiter following it *yet*.
-             # It's the last part or the next part isn't a delimiter.
-             break # Stop processing here, keep the rest in buffer
+             break
 
-    # Determine what's left in the buffer
     if processed_len > 0:
          tts_sentence_buffer = tts_sentence_buffer[processed_len:]
          chunk_to_speak = "".join(temp_buffer).strip()
     else:
-         # No complete sentences found, leave buffer as is
          chunk_to_speak = ""
 
-
-    # Queue the chunk if we found complete sentences
     if chunk_to_speak:
         # print(f"[TTS Flush] Queuing chunk: '{chunk_to_speak[:50]}...' ({len(chunk_to_speak)} chars)")
         tts_queue.put(chunk_to_speak)
-        # Worker thread will set tts_busy when it starts speaking
 
 def periodic_tts_check():
     """Periodically checks if TTS buffer can be flushed."""
@@ -538,78 +445,53 @@ def periodic_tts_check():
     except Exception as e:
         print(f"[TTS Check] Error during periodic flush: {e}")
     finally:
-        # Reschedule even if flushing fails, to keep checking
-        # Check if window still exists before scheduling
-        if window and window.winfo_exists():
-             window.after(200, periodic_tts_check) # Check every 200ms
+        # Continue running as long as the application (Flask server) is running
+        # Use a timer event that reschedules itself
+        if flask_app: # Check if Flask app object exists
+             timer = threading.Timer(0.2, periodic_tts_check) # Check every 200ms
+             timer.daemon = True # Allow program to exit even if timer is pending
+             timer.start()
 
+# ============================================================================
+# Whisper & VAD Logic (Adapted for backend state and SSE updates)
+# ============================================================================
 
-# ========================
-# Whisper & VAD Setup (No changes needed for basic web integration)
-# ========================
 def initialize_whisper():
-    """Initializes the Whisper model. Returns True on success."""
+    """Initializes the Whisper model."""
     global whisper_model, whisper_initialized, whisper_model_size
     if whisper_initialized: return True
 
+    print(f"[Whisper] Attempting initialization (Model: {whisper_model_size})...")
     update_vad_status(f"Loading Whisper ({whisper_model_size})...", "blue")
+
+    # --- Environment Setup ---
+    os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
     try:
-        print(f"[Whisper] Initializing model ({whisper_model_size})...")
+        numba_cache_dir = os.path.join(tempfile.gettempdir(), 'numba_cache')
+        os.makedirs(numba_cache_dir, exist_ok=True)
+        os.environ['NUMBA_CACHE_DIR'] = numba_cache_dir
+    except Exception as cache_err:
+        print(f"[Whisper] Warning: Could not set NUMBA_CACHE_DIR: {cache_err}")
 
-        # Suppress symlink warnings if they cause issues (optional)
-        os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-        # os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1" # Use if needed
-
-        # --- Handle potential FasterWhisper issues ---
-        # Ensure NUMBA_CACHE_DIR is writable if using Numba (common with Whisper)
-        try:
-            numba_cache_dir = os.path.join(tempfile.gettempdir(), 'numba_cache')
-            os.makedirs(numba_cache_dir, exist_ok=True)
-            os.environ['NUMBA_CACHE_DIR'] = numba_cache_dir
-            print(f"[Whisper] Set NUMBA_CACHE_DIR to: {numba_cache_dir}")
-        except Exception as cache_err:
-            print(f"[Whisper] Warning: Could not set NUMBA_CACHE_DIR: {cache_err}")
-        # --- End FasterWhisper handling ---
-
+    try:
         if whisper_model_size.startswith("turbo"):
-            whisper_turbo_model_name = whisper_model_size.split("-", 1)[1] # e.g., "large-v3" or just "large"
+            # FasterWhisper
+            whisper_turbo_model_name = whisper_model_size.split("-", 1)[1]
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            # Recommended compute types based on device and capability
-            if device == "cuda":
-                # Check for float16 support (Ampere GPUs and later)
-                if torch.cuda.get_device_capability(0)[0] >= 7:
-                     compute_type = "float16"
-                else:
-                     compute_type = "float32" # Fallback for older GPUs
-            else:
-                 # Use int8 for CPU for better performance
-                 compute_type = "int8"
-            
+            compute_type = "float16" if device == "cuda" and torch.cuda.get_device_capability(0)[0] >= 7 else ("float32" if device == "cuda" else "int8")
             print(f"[Whisper] Using FasterWhisper: model={whisper_turbo_model_name}, device={device}, compute_type={compute_type}")
-            
-            # Add local_files_only=False initially, maybe set to True after first download
-            whisper_model = faster_whisper.WhisperModel(
-                 whisper_turbo_model_name, 
-                 device=device, 
-                 compute_type=compute_type,
-                 # download_root=os.path.join(tempfile.gettempdir(), "faster_whisper_models") # Optional: Specify download location
-                 # local_files_only=False, # Set to True after first successful download
-            )
-            print(f"[Whisper] FasterWhisper model loaded.")
-
-        else: # Standard OpenAI Whisper
+            whisper_model = faster_whisper.WhisperModel(whisper_turbo_model_name, device=device, compute_type=compute_type)
+        else:
+            # OpenAI Whisper
             print(f"[Whisper] Using OpenAI Whisper: model={whisper_model_size}")
             whisper_model = whisper.load_model(whisper_model_size)
-            print("[Whisper] OpenAI Whisper model loaded.")
 
         whisper_initialized = True
-        # Update status only if VAD is also ready or not needed
-        if vad_initialized or not voice_enabled.get():
+        print("[Whisper] Model initialization successful.")
+        if vad_initialized or not voice_enabled_state:
              update_vad_status(f"Whisper ({whisper_model_size}) ready.", "green")
         else:
              update_vad_status(f"Whisper OK, waiting VAD...", "blue")
-
-        print("[Whisper] Model initialization successful.")
         return True
 
     except ImportError as ie:
@@ -617,7 +499,7 @@ def initialize_whisper():
          whisper_initialized = False
          whisper_model = None
          update_vad_status("Whisper Import Error!", "red")
-         add_message_to_ui("error", f"Whisper Import Error: {ie}. Ensure necessary libraries are installed.")
+         send_error_to_web(f"Whisper Import Error: {ie}. Ensure libraries are installed.")
          return False
     except Exception as e:
         print(f"[Whisper] Error initializing model: {e}")
@@ -625,39 +507,45 @@ def initialize_whisper():
         whisper_initialized = False
         whisper_model = None
         update_vad_status("Whisper init failed!", "red")
-        add_message_to_ui("error", f"Failed to load Whisper {whisper_model_size} model: {e}")
+        send_error_to_web(f"Failed to load Whisper {whisper_model_size} model: {e}")
         return False
 
+
 def initialize_vad():
-    """Initializes the Silero VAD model. Returns True on success."""
+    """Initializes the Silero VAD model."""
     global vad_model, vad_utils, vad_get_speech_ts, vad_initialized
     if vad_initialized: return True
 
+    print("[VAD] Attempting initialization...")
     update_vad_status("Loading VAD model...", "blue")
     try:
-        print("[VAD] Initializing Silero VAD model...")
-        # Workaround for potential torch hub path issues on some systems
+        # Set hub dir within try-except
         try:
              torch_hub_dir = os.path.join(tempfile.gettempdir(), "torch_hub_silero")
              os.makedirs(torch_hub_dir, exist_ok=True)
              torch.hub.set_dir(torch_hub_dir)
-             print(f"[VAD] Set torch hub directory for Silero VAD: {torch_hub_dir}")
         except Exception as hub_dir_err:
              print(f"[VAD] Warning: Could not set custom torch hub directory: {hub_dir_err}")
 
-        # Try loading the model
-        vad_model, vad_utils = torch.hub.load(repo_or_dir='snakers4/silero-vad',
-                                              model='silero_vad',
-                                              force_reload=False, # Use cached if available
-                                              onnx=False, # Set to True if ONNX version is preferred/installed
-                                              trust_repo=True) # Required for custom models
-        
-        (vad_get_speech_ts, _, read_audio, VADIterator, _) = vad_utils # Get necessary functions
-        
+        # Load VAD model
+        vad_model_obj, vad_utils_funcs = torch.hub.load(repo_or_dir='snakers4/silero-vad',
+                                                  model='silero_vad',
+                                                  force_reload=False,
+                                                  onnx=False, # Set True if ONNX preferred
+                                                  trust_repo=True)
+        vad_model = vad_model_obj # Assign to global
+        vad_utils = vad_utils_funcs # Assign utils
+        # Extract specific function needed if available, otherwise maybe use VADIterator
+        if hasattr(vad_utils, 'get_speech_ts'):
+             vad_get_speech_ts = vad_utils.get_speech_ts
+        else:
+            # Fallback or alternative approach might be needed if get_speech_ts isn't directly available
+            print("[VAD] Warning: 'get_speech_ts' not found directly in vad_utils. VAD logic might need adjustment.")
+            # For this implementation, we'll rely on the model's direct probability output instead.
+
         vad_initialized = True
         print("[VAD] Model initialized successfully.")
-        # Update status only if Whisper is also ready or not needed
-        if whisper_initialized or not voice_enabled.get():
+        if whisper_initialized or not voice_enabled_state:
              update_vad_status("VAD Ready.", "green")
         else:
              update_vad_status("VAD OK, waiting Whisper...", "blue")
@@ -668,1910 +556,1189 @@ def initialize_vad():
         vad_initialized = False
         vad_model = None
         update_vad_status("VAD init failed!", "red")
-        add_message_to_ui("error", f"Failed to load Silero VAD model: {e}")
+        send_error_to_web(f"Failed to load Silero VAD model: {e}")
         return False
 
 def initialize_audio_system():
-    """Initializes PyAudio. Returns True on success."""
+    """Initializes PyAudio."""
     global py_audio
     if py_audio: return True
     try:
         print("[Audio] Initializing PyAudio...")
         py_audio = pyaudio.PyAudio()
-        print("[Audio] PyAudio initialized.")
-        # Optional: Print available devices for debugging
-        # print("[Audio] Available Input Devices:")
-        # for i in range(py_audio.get_device_count()):
+        # Optional: Log available devices
+        # num_devices = py_audio.get_device_count()
+        # print(f"[Audio] Found {num_devices} devices.")
+        # for i in range(num_devices):
         #     dev_info = py_audio.get_device_info_by_index(i)
         #     if dev_info.get('maxInputChannels') > 0:
-        #          print(f"  {i}: {dev_info.get('name')} (Channels: {dev_info.get('maxInputChannels')})")
+        #         print(f"  Input Device {i}: {dev_info.get('name')}")
+        print("[Audio] PyAudio initialized.")
         return True
     except Exception as e:
         print(f"[Audio] Error initializing PyAudio: {e}")
         traceback.print_exc()
-        add_message_to_ui("error", f"Failed to initialize audio system: {e}. Check microphone permissions and drivers.")
+        send_error_to_web(f"Failed to initialize audio system: {e}. Check microphone permissions and drivers.")
         py_audio = None
         return False
 
 def vad_worker():
     """Worker thread for continuous VAD and triggering recording."""
-    global py_audio, audio_stream, vad_audio_buffer, audio_frames_buffer, is_recording_for_whisper
-    global vad_model, vad_get_speech_ts, vad_stop_event, temp_audio_file_path, whisper_queue
-    global tts_busy, tts_busy_lock, window # Access main window for scheduling UI updates
+    global py_audio, vad_audio_buffer, audio_frames_buffer, is_recording_for_whisper
+    global vad_model, vad_stop_event, temp_audio_file_path, whisper_queue
+    global tts_busy, tts_busy_lock, voice_enabled_state
 
     print("[VAD Worker] Thread started.")
-
     stream = None
     try:
-        # Check if audio system is initialized
         if not py_audio:
-            print("[VAD Worker] PyAudio not initialized. Cannot start.")
+            print("[VAD Worker] PyAudio not initialized. Exiting.")
             update_vad_status("Audio System Error!", "red")
             return
 
-        # Open audio stream
         try:
-             stream = py_audio.open(format=FORMAT,
-                                    channels=CHANNELS,
-                                    rate=RATE,
-                                    input=True,
-                                    frames_per_buffer=VAD_CHUNK) # Use smaller chunk for VAD
-             print("[VAD Worker] Audio stream opened successfully.")
-        except OSError as ose:
-             print(f"[VAD Worker] OSError opening audio stream: {ose}")
-             # Provide more specific feedback if possible (e.g., device unavailable)
-             if "Invalid input device" in str(ose) or "No Default Input Device Available" in str(ose):
-                  msg = "Audio Error: No valid input device found or device unavailable."
-             else:
-                  msg = f"Audio Error: {ose}"
-             update_vad_status("Audio Input Error!", "red")
-             add_message_to_ui("error", msg)
-             return # Cannot continue without a stream
+            stream = py_audio.open(format=FORMAT, channels=CHANNELS, rate=RATE,
+                                   input=True, frames_per_buffer=VAD_CHUNK)
+            print("[VAD Worker] Audio stream opened.")
         except Exception as e:
-             print(f"[VAD Worker] Unexpected error opening audio stream: {e}")
-             update_vad_status("Audio Init Error!", "red")
-             add_message_to_ui("error", f"Failed to open audio stream: {e}")
-             return
+            print(f"[VAD Worker] Failed to open audio stream: {e}")
+            update_vad_status("Audio Input Error!", "red")
+            send_error_to_web(f"Failed to open audio stream: {e}")
+            return
 
         update_vad_status("Listening...", "gray")
 
-        num_silence_frames = 0
-        silence_frame_limit = int(SILENCE_THRESHOLD_SECONDS * RATE / VAD_CHUNK)
-        # speech_detected_recently = False # Not strictly needed with current logic
         frames_since_last_speech = 0
+        silence_frame_limit = int(SILENCE_THRESHOLD_SECONDS * RATE / VAD_CHUNK)
         min_speech_frames = int(MIN_SPEECH_DURATION_SECONDS * RATE / VAD_CHUNK)
         pre_speech_buffer_frames = int(PRE_SPEECH_BUFFER_SECONDS * RATE / VAD_CHUNK)
 
         temp_pre_speech_buffer = deque(maxlen=pre_speech_buffer_frames)
-        was_tts_busy = False  # Track previous TTS state
+        was_tts_busy = False
 
         while not vad_stop_event.is_set():
+            if not voice_enabled_state: # Check if VAD got disabled externally
+                 print("[VAD Worker] Voice disabled, stopping listening loop.")
+                 break
             try:
-                # Read audio data
                 data = stream.read(VAD_CHUNK, exception_on_overflow=False)
 
-                # Check TTS state (thread-safe)
-                with tts_busy_lock:
-                    current_tts_busy = tts_busy
+                with tts_busy_lock: current_tts_busy = tts_busy
 
-                # --- Handle TTS Interference ---
                 if current_tts_busy:
-                    if not was_tts_busy: # Only update status on transition
-                        print("[VAD Worker] TTS active, pausing VAD.")
+                    if not was_tts_busy:
+                        # print("[VAD Worker] TTS active, pausing VAD.")
                         update_vad_status("VAD Paused (TTS Active)", "blue")
                         was_tts_busy = True
-                    # If we were recording, discard it to avoid capturing TTS output
                     if is_recording_for_whisper:
-                        print("[VAD Worker] Discarding active recording due to TTS.")
+                        # print("[VAD Worker] Discarding active recording due to TTS.")
                         is_recording_for_whisper = False
                         audio_frames_buffer.clear()
-                        temp_pre_speech_buffer.clear() # Also clear pre-buffer
-                    # Skip VAD processing for this chunk
-                    time.sleep(0.05) # Small sleep to yield CPU
+                        temp_pre_speech_buffer.clear()
+                    time.sleep(0.05)
                     continue
-                elif was_tts_busy: # TTS just finished
-                     print("[VAD Worker] TTS finished, resuming VAD.")
+                elif was_tts_busy:
+                     # print("[VAD Worker] TTS finished, resuming VAD.")
                      update_vad_status("Listening...", "gray")
                      was_tts_busy = False
-                     # Reset silence counters after TTS finishes
-                     frames_since_last_speech = 0
-                     # Give it a very brief moment for audio pipe to clear
+                     frames_since_last_speech = 0 # Reset silence count
                      time.sleep(0.1)
-                     continue # Process next chunk cleanly
+                     continue
 
-                # --- Normal VAD Processing ---
+                # --- Normal VAD ---
                 audio_chunk_np = np.frombuffer(data, dtype=np.int16)
-                vad_audio_buffer.append(audio_chunk_np)
-                temp_pre_speech_buffer.append(data) # Store raw bytes for pre-buffer
+                temp_pre_speech_buffer.append(data)
 
-                # Only run VAD if buffer has enough data (e.g., >= 30ms chunk for Silero)
-                # Silero VAD expects chunks of specific sizes (e.g., 256, 512, 768, 1024, 1536 samples @ 16kHz)
-                # We use VAD_CHUNK=512, which is valid.
-                audio_float32 = audio_chunk_np.astype(np.float32) / 32768.0 # Normalize
+                # Process chunk for VAD probability
+                audio_float32 = audio_chunk_np.astype(np.float32) / 32768.0
                 audio_tensor = torch.from_numpy(audio_float32)
-
-                # Get speech probability (more robust than just timestamps)
-                speech_prob = vad_model(audio_tensor.unsqueeze(0), RATE).item()
-                is_speech = speech_prob > 0.4 # Adjust threshold if needed
+                try:
+                    # Ensure vad_model is callable (it should be the loaded model object)
+                    if callable(vad_model):
+                         speech_prob = vad_model(audio_tensor.unsqueeze(0), RATE).item()
+                         is_speech = speech_prob > 0.45 # Slightly higher threshold maybe
+                    else:
+                         print("[VAD Worker] Error: vad_model is not callable.")
+                         is_speech = False # Assume no speech if model isn't working
+                except Exception as vad_err:
+                     print(f"[VAD Worker] Error during VAD inference: {vad_err}")
+                     is_speech = False # Assume no speech on error
 
                 if is_speech:
                     # print(f"Speech detected (Prob: {speech_prob:.2f})") # Debug
                     frames_since_last_speech = 0
                     if not is_recording_for_whisper:
-                        print("[VAD Worker] Speech started, beginning recording.")
+                        # print("[VAD Worker] Speech started, beginning recording.")
                         is_recording_for_whisper = True
                         audio_frames_buffer.clear()
-                        # Add pre-speech buffer content
-                        for frame_data in temp_pre_speech_buffer:
-                            audio_frames_buffer.append(frame_data)
-                        # Don't add current chunk here yet, add below
+                        audio_frames_buffer.extend(temp_pre_speech_buffer) # Add pre-buffer
                         update_vad_status("Recording...", "red")
-
-                    # Append current data *if* recording (or just started)
-                    if is_recording_for_whisper:
+                    if is_recording_for_whisper: # Should always be true here now
                          audio_frames_buffer.append(data)
 
-                else: # No speech detected in this chunk
+                else: # No speech
                     frames_since_last_speech += 1
-                    # If recording, still append data until silence threshold is met
                     if is_recording_for_whisper:
-                         audio_frames_buffer.append(data)
+                        audio_frames_buffer.append(data) # Keep recording until silence threshold
 
-                         # Check if silence duration exceeds threshold
-                         if frames_since_last_speech > silence_frame_limit:
-                            print(f"[VAD Worker] Silence detected ({SILENCE_THRESHOLD_SECONDS}s), stopping recording.")
-                            is_recording_for_whisper = False # Stop recording *before* processing
-
-                            # --- Process the recorded audio ---
+                        if frames_since_last_speech > silence_frame_limit:
+                            # print(f"[VAD Worker] Silence detected ({SILENCE_THRESHOLD_SECONDS}s), stopping recording.")
+                            is_recording_for_whisper = False
                             total_frames = len(audio_frames_buffer)
                             recording_duration = total_frames * VAD_CHUNK / RATE
-                            effective_speech_frames = total_frames - frames_since_last_speech # Approximate speech part
+                            effective_speech_frames = max(0, total_frames - frames_since_last_speech)
 
-                            print(f"[VAD Worker] Total recording duration: {recording_duration:.2f}s")
+                            # print(f"[VAD Worker] Recording duration: {recording_duration:.2f}s")
 
-                            # Check if meets minimum *speech* duration (ignoring pre/post buffer/silence)
                             if effective_speech_frames < min_speech_frames:
-                                print(f"[VAD Worker] Effective speech too short ({effective_speech_frames * VAD_CHUNK / RATE:.2f}s < {MIN_SPEECH_DURATION_SECONDS:.2f}s), discarding.")
-                                audio_frames_buffer.clear() # Discard data
+                                # print(f"[VAD Worker] Speech too short ({effective_speech_frames * VAD_CHUNK / RATE:.2f}s), discarding.")
+                                audio_frames_buffer.clear()
                                 update_vad_status("Too short, discarded", "orange")
-                                # Schedule return to listening state after a brief pause
-                                if window and window.winfo_exists():
-                                     window.after(800, lambda: update_vad_status("Listening...", "gray"))
-
-                            else: # Sufficient speech duration, save and queue
+                                time.sleep(0.8) # Pause before listening again
+                                update_vad_status("Listening...", "gray")
+                            else:
                                 try:
-                                     temp_audio_file = tempfile.NamedTemporaryFile(prefix="vad_rec_", suffix=".wav", delete=False)
-                                     temp_audio_file_path = temp_audio_file.name
-                                     temp_audio_file.close() # Close it so wave can open it
+                                    temp_audio_file = tempfile.NamedTemporaryFile(prefix="vad_rec_", suffix=".wav", delete=False)
+                                    temp_audio_file_path = temp_audio_file.name
+                                    temp_audio_file.close()
 
-                                     wf = wave.open(temp_audio_file_path, 'wb')
-                                     wf.setnchannels(CHANNELS)
-                                     wf.setsampwidth(py_audio.get_sample_size(FORMAT))
-                                     wf.setframerate(RATE)
-                                     wf.writeframes(b''.join(audio_frames_buffer))
-                                     wf.close()
-                                     print(f"[VAD Worker] Audio saved to {temp_audio_file_path} ({recording_duration:.2f}s)")
-
-                                     # Queue for transcription
-                                     whisper_queue.put(temp_audio_file_path)
-                                     update_vad_status("Processing...", "blue") # UI update continues in whisper worker
-
+                                    wf = wave.open(temp_audio_file_path, 'wb')
+                                    wf.setnchannels(CHANNELS)
+                                    wf.setsampwidth(py_audio.get_sample_size(FORMAT))
+                                    wf.setframerate(RATE)
+                                    wf.writeframes(b''.join(audio_frames_buffer))
+                                    wf.close()
+                                    # print(f"[VAD Worker] Audio saved to {temp_audio_file_path} ({recording_duration:.2f}s)")
+                                    whisper_queue.put(temp_audio_file_path)
+                                    update_vad_status("Processing...", "blue")
                                 except Exception as save_err:
                                      print(f"[VAD Worker] Error saving audio file: {save_err}")
                                      update_vad_status("File Save Error", "red")
-                                     # Schedule return to listening state
-                                     if window and window.winfo_exists():
-                                          window.after(1000, lambda: update_vad_status("Listening...", "gray"))
+                                     time.sleep(1)
+                                     update_vad_status("Listening...", "gray")
 
-                            # Clear buffer for next recording regardless of outcome
-                            audio_frames_buffer.clear()
-                            # No need to clear pre-speech buffer here, it's rolling
+                            audio_frames_buffer.clear() # Clear buffer after processing/discarding
 
-                    # If not recording, update status to listening (unless transitioning from TTS)
-                    if not is_recording_for_whisper and not was_tts_busy:
-                         update_vad_status("Listening...", "gray")
+                    # If not recording and not just finished TTS, ensure status is Listening
+                    elif not was_tts_busy:
+                          current_status = get_vad_status()
+                          if current_status.get("text") not in ["Listening...", "Too short, discarded", "Processing..."]:
+                              update_vad_status("Listening...", "gray")
 
 
             except IOError as e:
                 if e.errno == pyaudio.paInputOverflowed:
-                    print("[VAD Worker] Warning: Input overflowed. Skipping frame.")
-                    # Consider adding a small delay or buffer clearing strategy if this happens frequently
+                    print("[VAD Worker] Warning: Input overflowed.")
                 else:
                     print(f"[VAD Worker] Stream read error: {e}")
-                    # Attempt to recover or signal critical error
                     update_vad_status("Audio Stream Error!", "red")
-                    vad_stop_event.set() # Stop the worker on critical stream errors
-                    break # Exit the loop
+                    vad_stop_event.set() # Stop worker on critical error
+                    break
             except Exception as e:
                 print(f"[VAD Worker] Unexpected error in loop: {e}")
                 traceback.print_exc()
-                time.sleep(0.1) # Avoid busy-looping on unexpected errors
+                time.sleep(0.1)
 
     except Exception as e:
-        # Errors during initialization or stream opening
-        print(f"[VAD Worker] Initialization or stream opening error: {e}")
-        # Status update likely already happened in the failing part
+        print(f"[VAD Worker] Error during setup: {e}")
     finally:
-        # Cleanup
         print("[VAD Worker] Cleaning up...")
         if stream:
-            if stream.is_active():
-                 try: stream.stop_stream()
-                 except Exception as stop_e: print(f"[VAD Worker] Error stopping stream: {stop_e}")
-            try: stream.close()
-            except Exception as close_e: print(f"[VAD Worker] Error closing stream: {close_e}")
-            print("[VAD Worker] Audio stream closed.")
+            try:
+                if stream.is_active(): stream.stop_stream()
+                stream.close()
+                print("[VAD Worker] Audio stream closed.")
+            except Exception as e: print(f"[VAD Worker] Error closing stream: {e}")
 
-        # Reset state variables
         is_recording_for_whisper = False
         audio_frames_buffer.clear()
         vad_audio_buffer.clear()
-        temp_pre_speech_buffer.clear()
 
-        # Update final status based on why we exited
+        # Set final status based on why we exited
         if vad_stop_event.is_set():
-            # If stopped normally by user toggle or critical error handled above
-            if "Audio Stream Error!" not in (recording_indicator_widget.cget("text") if recording_indicator_widget else ""):
-                 # Avoid overwriting specific error messages
+             if get_vad_status()["text"] not in ["Audio Stream Error!", "Audio Input Error!"]:
                  update_vad_status("Voice Disabled", "grey")
-        else:
-            # Exited due to an unhandled error within the loop
-            update_vad_status("VAD Stopped (Error)", "red")
+        else: # Exited due to loop error or external state change
+            if voice_enabled_state: # If voice still meant to be on, it's an error
+                update_vad_status("VAD Stopped (Error)", "red")
+            else: # If voice was disabled externally, that's expected
+                 update_vad_status("Voice Disabled", "grey")
+
 
     print("[VAD Worker] Thread finished.")
 
 def process_audio_worker():
     """Worker thread to transcribe audio files from the whisper_queue."""
-    global whisper_model, whisper_initialized, whisper_queue, whisper_language, window
-    global whisper_model_size # Access model size for logic
+    global whisper_model, whisper_initialized, whisper_queue, whisper_language_state
+    global whisper_model_size, voice_enabled_state
     print("[Whisper Worker] Thread started.")
     while True:
         try:
-            audio_file_path = whisper_queue.get() # Blocks
-            if audio_file_path is None: # Sentinel
+            audio_file_path = whisper_queue.get()
+            if audio_file_path is None:
                 print("[Whisper Worker] Received stop signal.")
                 break
 
-            if not whisper_initialized or not voice_enabled.get():
-                print("[Whisper Worker] Skipping transcription (Whisper/Voice disabled or not ready).")
-                if audio_file_path and os.path.exists(audio_file_path):
-                     try: os.unlink(audio_file_path); print(f"[Whisper Worker] Deleted unused audio file: {audio_file_path}")
-                     except Exception as del_err: print(f"[Whisper Worker] Error deleting unused file: {del_err}")
+            if not whisper_initialized or not voice_enabled_state:
+                # print("[Whisper Worker] Skipping transcription (disabled or not ready).")
+                if os.path.exists(audio_file_path):
+                    try: os.unlink(audio_file_path)
+                    except Exception as del_e: print(f"[Whisper Worker] Error deleting unused file: {del_e}")
                 whisper_queue.task_done()
-                # Ensure VAD status returns to listening if appropriate
-                if voice_enabled.get() and vad_initialized and not is_recording_for_whisper:
-                     update_vad_status("Listening...", "gray")
+                # If VAD is still supposed to be running, reset its status
+                if voice_enabled_state and vad_initialized and not is_recording_for_whisper:
+                    update_vad_status("Listening...", "gray")
                 continue
 
-            print(f"[Whisper Worker] Processing audio file: {audio_file_path}")
+            print(f"[Whisper Worker] Processing: {os.path.basename(audio_file_path)}")
             update_vad_status("Transcribing...", "orange")
-
             start_time = time.time()
             transcribed_text = ""
             detected_language = "N/A"
-            try:
-                 # Use selected language, None means auto-detect
-                 lang_to_use = whisper_language if whisper_language else None
-                 print(f"[Whisper Worker] Using language: {'Auto' if lang_to_use is None else lang_to_use}")
 
-                 # --- Choose transcription method based on model type ---
-                 if isinstance(whisper_model, faster_whisper.WhisperModel):
-                     # FasterWhisper (turbo models)
-                     # Consider adding beam_size, temperature etc. as parameters if needed
-                     segments, info = whisper_model.transcribe(audio_file_path,
-                                                               language=lang_to_use,
-                                                               # beam_size=5, # Optional
-                                                               # vad_filter=True, # Optional: Use FasterWhisper's VAD
-                                                               # vad_parameters=dict(threshold=0.5), # Optional VAD params
-                                                               )
-                     transcribed_text = " ".join([segment.text for segment in segments]).strip()
-                     detected_language = info.language if hasattr(info, 'language') else 'N/A'
-                     print(f"[Whisper Worker] FasterWhisper detected language: {detected_language} (Prob: {info.language_probability if hasattr(info, 'language_probability') else 'N/A'})")
-                 
-                 elif isinstance(whisper_model, whisper.Whisper):
-                    # OpenAI Whisper
+            try:
+                lang_to_use = whisper_language_state # Already set via API/default
+                # print(f"[Whisper Worker] Using language: {'Auto' if lang_to_use is None else lang_to_use}")
+
+                if isinstance(whisper_model, faster_whisper.WhisperModel):
+                    segments, info = whisper_model.transcribe(audio_file_path, language=lang_to_use)
+                    transcribed_text = " ".join([segment.text for segment in segments]).strip()
+                    detected_language = info.language if hasattr(info, 'language') else 'N/A'
+                elif isinstance(whisper_model, whisper.Whisper):
                     result = whisper_model.transcribe(audio_file_path, language=lang_to_use)
                     transcribed_text = result["text"].strip()
                     detected_language = result.get("language", "N/A")
-                    print(f"[Whisper Worker] OpenAI Whisper detected language: {detected_language}")
-                    
-                 else:
-                     print("[Whisper Worker] Error: Unknown Whisper model type.")
-                     raise TypeError("Unsupported Whisper model object")
+                else:
+                    raise TypeError("Unsupported Whisper model object")
 
+                duration = time.time() - start_time
+                print(f"[Whisper Worker] Transcription ({detected_language}, {duration:.2f}s): '{transcribed_text}'")
 
-                 duration = time.time() - start_time
-                 print(f"[Whisper Worker] Transcription complete in {duration:.2f}s: '{transcribed_text}'")
-
-                 # Schedule UI update on main thread
-                 if window and window.winfo_exists():
-                     if transcribed_text:
-                         window.after(0, update_input_with_transcription, transcribed_text)
-                         update_vad_status("Transcription Ready", "green")
-                     else:
-                         update_vad_status("No speech detected", "orange")
-                         # Schedule return to listening state after a brief pause
-                         window.after(800, lambda: update_vad_status("Listening...", "gray"))
+                if transcribed_text:
+                    # Send transcription result via SSE
+                    web_output_queue.put({
+                        "type": "transcription",
+                        "data": {
+                            "text": transcribed_text,
+                            "language": detected_language
+                        }
+                    })
+                    update_vad_status("Transcription Ready", "green")
+                    time.sleep(1.0) # Show "Ready" briefly
+                    update_vad_status("Listening...", "gray")
+                else:
+                    update_vad_status("No speech detected", "orange")
+                    time.sleep(0.8)
+                    update_vad_status("Listening...", "gray")
 
             except Exception as e:
-                print(f"[Whisper Worker] Error during transcription: {e}")
+                print(f"[Whisper Worker] Transcription Error: {e}")
                 traceback.print_exc()
                 update_vad_status("Transcription Error", "red")
-                 # Schedule return to listening state after error display
-                if window and window.winfo_exists():
-                     window.after(1500, lambda: update_vad_status("Listening...", "gray"))
+                send_error_to_web(f"Transcription failed: {e}")
+                time.sleep(1.5)
+                update_vad_status("Listening...", "gray")
             finally:
-                # Clean up the temporary audio file
-                if audio_file_path and os.path.exists(audio_file_path):
+                if os.path.exists(audio_file_path):
                     try: os.unlink(audio_file_path)
                     except Exception as e: print(f"[Whisper Worker] Error deleting temp file {audio_file_path}: {e}")
-
             whisper_queue.task_done()
 
         except Exception as e:
-            # Catch errors in the loop itself (e.g., queue errors)
             print(f"[Whisper Worker] Error in main loop: {e}")
             traceback.print_exc()
-            # Ensure task_done is called even if outer loop breaks somehow
-            if 'audio_file_path' in locals() and audio_file_path is not None:
-                 whisper_queue.task_done()
-
+            # Ensure task_done if exception occurs after getting item
+            if 'audio_file_path' in locals() and audio_file_path:
+                whisper_queue.task_done()
 
     print("[Whisper Worker] Thread finished.")
 
-def update_input_with_transcription(text):
-    """Updates the user input text box with the transcribed text (runs in main thread)."""
-    global user_input_widget, auto_send_after_transcription, window
-    if not user_input_widget: return
 
-    try:
-        current_text = user_input_widget.get("1.0", tk.END).strip()
-        if current_text:
-            user_input_widget.insert(tk.END, " " + text)
-        else:
-            user_input_widget.insert("1.0", text)
+def set_whisper_language(lang_code):
+    """Sets the language for Whisper transcription via API."""
+    global whisper_language_state
+    # Find the language name for logging, but store the code
+    lang_name = "Unknown"
+    valid_code = False
+    for name, code in WHISPER_LANGUAGES.items():
+        if code == lang_code:
+            lang_name = name
+            valid_code = True
+            break
+    if lang_code is None: # Handle Auto-Detect explicitly
+         lang_name = "Auto Detect"
+         valid_code = True
 
-        # Scroll to the end of the input box
-        user_input_widget.see(tk.END)
-        user_input_widget.update_idletasks() # Ensure UI updates
+    if valid_code:
+        whisper_language_state = lang_code
+        print(f"[Whisper] Language set to: {lang_name} ({whisper_language_state})")
+        send_status_to_web(f"Whisper language set to: {lang_name}")
+        return True
+    else:
+        print(f"[Whisper] Error: Invalid language code received: {lang_code}")
+        send_error_to_web(f"Invalid Whisper language code: {lang_code}")
+        return False
 
-        # Automatically send message if option is enabled
-        if auto_send_after_transcription and auto_send_after_transcription.get():
-            # Small delay to let UI update completely visually
-            if window and window.winfo_exists():
-                 window.after(150, send_message) # Increased delay slightly
-        else:
-             # If not auto-sending, return VAD status to Listening after showing result
-             if window and window.winfo_exists():
-                 window.after(800, lambda: update_vad_status("Listening...", "gray"))
+def set_whisper_model(size):
+    """Sets Whisper model size and triggers re-initialization if needed via API."""
+    global whisper_model_size, whisper_initialized, whisper_model
+    if size not in WHISPER_MODEL_SIZES:
+        print(f"[Whisper] Error: Invalid model size received: {size}")
+        send_error_to_web(f"Invalid Whisper model size: {size}")
+        return False
 
-    except tk.TclError as e:
-         print(f"[UI Update] Error updating input widget (maybe closed?): {e}")
-    except Exception as e:
-         print(f"[UI Update] Unexpected error updating input: {e}")
-         traceback.print_exc()
+    if size == whisper_model_size and whisper_initialized:
+        print(f"[Whisper] Model size '{size}' already selected and initialized.")
+        return True # No change needed
 
+    print(f"[Whisper] Model size change requested to: {size}. Re-initialization required.")
+    whisper_model_size = size
+    whisper_initialized = False
+    if whisper_model:
+        print("[Whisper] Releasing old model object...")
+        try:
+            del whisper_model
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+        except Exception as del_err: print(f"[Whisper] Error during old model cleanup: {del_err}")
+        whisper_model = None
 
-def toggle_voice_recognition():
-    """Enables/disables VAD and Whisper (runs in main thread)."""
-    global voice_enabled, whisper_initialized, vad_initialized, vad_thread, vad_stop_event
-    global py_audio, whisper_processing_thread
+    send_status_to_web(f"Whisper model set to {size}. Will reload if/when voice input is active.")
 
-    # Update language setting just in case it changed via UI but wasn't applied
-    set_whisper_language()
-    # Update model size setting similarly
-    set_whisper_model_size()
+    # If voice recognition is currently enabled, trigger immediate re-initialization
+    if voice_enabled_state:
+        print("[Whisper] Voice enabled, attempting immediate re-initialization...")
+        threading.Thread(target=initialize_whisper, daemon=True).start() # Init in background
+    return True
 
-    if voice_enabled.get():
-        print("[Voice] Enabling voice recognition...")
+def toggle_voice_recognition(enable):
+    """Enables/disables VAD and Whisper via API."""
+    global voice_enabled_state, whisper_initialized, vad_initialized, vad_thread, vad_stop_event
+    global py_audio, whisper_processing_thread # Make sure all globals accessed are listed
+
+    if enable:
+        if voice_enabled_state and vad_thread and vad_thread.is_alive():
+             print("[Voice] Voice recognition already enabled.")
+             return True # Already running
+
+        print("[Voice] Enabling voice recognition by API request...")
+        voice_enabled_state = True # Set desired state first
         update_vad_status("Initializing...", "blue")
-        all_initialized = True
 
-        # Initialize components sequentially
-        if not py_audio:
-            print("[Voice] Initializing Audio System...")
-            if not initialize_audio_system(): all_initialized = False
-            else: print("[Voice] Audio System OK.")
+        # --- Initialization Sequence (run in background to avoid blocking API response) ---
+        def init_and_start_vad():
+            # --- ADD THIS LINE ---
+            global voice_enabled_state, py_audio, whisper_initialized, vad_initialized # Declare globals used within this nested function
+            # --- END ADD ---
 
-        # Only proceed if audio system is OK
-        if all_initialized and not whisper_initialized:
-            print("[Voice] Initializing Whisper...")
-            if not initialize_whisper(): all_initialized = False
-            else: print("[Voice] Whisper OK.") # Status updated inside init
+            all_initialized = True
+            # Init components if needed
+            if not py_audio:
+                 if not initialize_audio_system(): all_initialized = False
+            if all_initialized and not whisper_initialized:
+                 if not initialize_whisper(): all_initialized = False
+            if all_initialized and not vad_initialized:
+                 if not initialize_vad(): all_initialized = False
 
-        # Only proceed if Whisper is OK (or wasn't needed)
-        if all_initialized and not vad_initialized:
-            print("[Voice] Initializing VAD...")
-            if not initialize_vad(): all_initialized = False
-            else: print("[Voice] VAD OK.") # Status updated inside init
+            # Start threads if all OK and still enabled
+            # Now this line will correctly read the global state
+            if all_initialized and voice_enabled_state:
+                # Access other globals needed for thread management
+                global whisper_processing_thread, vad_thread, vad_stop_event
 
-        # --- Start threads if all components initialized ---
-        if all_initialized:
-            # Start Whisper processing thread if not running
-            if whisper_processing_thread is None or not whisper_processing_thread.is_alive():
-                print("[Voice] Starting Whisper processing thread...")
-                whisper_processing_thread = threading.Thread(target=process_audio_worker, daemon=True)
-                whisper_processing_thread.start()
-            else:
-                 print("[Voice] Whisper processing thread already running.")
+                if whisper_processing_thread is None or not whisper_processing_thread.is_alive():
+                    print("[Voice] Starting Whisper processing thread...")
+                    whisper_processing_thread = threading.Thread(target=process_audio_worker, daemon=True)
+                    whisper_processing_thread.start()
 
-            # Start VAD worker thread if not running
-            if vad_thread is None or not vad_thread.is_alive():
-                print("[Voice] Starting VAD worker thread...")
-                vad_stop_event.clear() # Reset stop event
-                vad_thread = threading.Thread(target=vad_worker, daemon=True)
-                vad_thread.start()
-            else:
-                 print("[Voice] VAD worker thread already running.")
+                if vad_thread is None or not vad_thread.is_alive():
+                    print("[Voice] Starting VAD worker thread...")
+                    vad_stop_event.clear()
+                    vad_thread = threading.Thread(target=vad_worker, daemon=True)
+                    vad_thread.start()
+                # VAD worker will set "Listening..." status
+                print("[Voice] Voice recognition enabled successfully.")
+                send_status_to_web("Voice Input Enabled.")
+            elif voice_enabled_state: # Still enabled, but init failed
+                print("[Voice] Enabling failed due to initialization errors.")
+                # Status should reflect the specific error from init functions
+                voice_enabled_state = False # This assignment makes Python assume it's local without 'global'
+                send_error_to_web("Voice Input enabling failed (initialization error).")
+            else: # Was disabled again before init finished
+                 print("[Voice] Initialization aborted as voice was disabled.")
 
-            # Final status update if VAD started successfully (VAD worker sets "Listening...")
-            # We can set a temporary "Enabled" status here.
-            if vad_thread and vad_thread.is_alive():
-                 update_vad_status("Voice Enabled", "green")
-                 print("[Voice] Voice recognition enabled successfully.")
-            else:
-                 # This case shouldn't happen if init was successful, but handle defensively
-                 print("[Voice] Enabling failed: VAD thread did not start.")
-                 update_vad_status("VAD Start Failed", "red")
-                 voice_enabled.set(False) # Uncheck the box
+        threading.Thread(target=init_and_start_vad, daemon=True).start()
+        return True # API call initiates the process
 
-        else: # Initialization failed somewhere
-            print("[Voice] Enabling failed due to initialization errors.")
-            voice_enabled.set(False) # Uncheck the box
-            # Status should already be showing the specific error (Whisper/VAD/Audio)
-            if not (whisper_initialized or vad_initialized or py_audio):
-                 update_vad_status("Init Failed", "red") # Generic fallback
-
-    else: # Disabling voice recognition
-        print("[Voice] Disabling voice recognition...")
+    else: # Disabling
+        if not voice_enabled_state:
+             print("[Voice] Voice recognition already disabled.")
+             return True
+        print("[Voice] Disabling voice recognition by API request...")
+        voice_enabled_state = False # Set desired state
         update_vad_status("Disabling...", "grey")
         if vad_thread and vad_thread.is_alive():
             print("[Voice] Signaling VAD worker to stop...")
-            vad_stop_event.set() # Signal VAD worker to stop
-            # VAD worker handles stream closing and sets final status ("Voice Disabled")
-            # We don't join here to keep UI responsive, worker cleans up in background
+            vad_stop_event.set()
+            # VAD worker will update status to Disabled when it exits
         else:
-             print("[Voice] VAD worker already stopped.")
-             # Manually set status if VAD wasn't running
-             update_vad_status("Voice Disabled", "grey")
-
-        # Note: We keep the whisper processing thread alive, it waits on the queue.
-        # We also keep PyAudio initialized unless explicitly closed on app exit.
+            update_vad_status("Voice Disabled", "grey") # Update status if thread wasn't running
+        # Whisper thread keeps running, waits on queue.
         print("[Voice] Voice recognition disabled.")
+        send_status_to_web("Voice Input Disabled.")
+        return True
+
+# ============================================================================
+# File Processing Logic
+# ============================================================================
 
 def extract_pdf_content(pdf_path):
-    """Extracts text content from a PDF file."""
+    """Extracts text content from a PDF file (same as before)."""
     try:
         doc = fitz.open(pdf_path)
         text_content = ""
-        metadata = doc.metadata or {} # Ensure metadata is a dict
-
-        # Add basic metadata if available
+        metadata = doc.metadata or {}
         title = metadata.get('title', 'N/A')
         author = metadata.get('author', 'N/A')
         if title != 'N/A' or author != 'N/A':
              text_content += f"--- PDF Info ---\nTitle: {title}\nAuthor: {author}\n----------------\n\n"
 
-        # Extract text from each page
         num_pages = doc.page_count
-        max_chars_per_pdf = 20000 # Limit total chars extracted
+        max_chars_per_pdf = 20000
         current_chars = len(text_content)
         truncated = False
 
         for page_num in range(num_pages):
             page = doc.load_page(page_num)
-            page_text = page.get_text("text", sort=True).strip() # Get text, sorted for reading order
-            
-            if not page_text: # Skip empty pages
-                 continue
+            page_text = page.get_text("text", sort=True).strip()
+            if not page_text: continue
 
             page_header = f"--- Page {page_num+1} of {num_pages} ---\n"
-            page_text_len = len(page_header) + len(page_text) + 2 # +2 for newlines
+            page_text_len = len(page_header) + len(page_text) + 2
 
             if current_chars + page_text_len > max_chars_per_pdf:
-                 # Calculate remaining chars and truncate page text
-                 remaining_chars = max_chars_per_pdf - current_chars - len(page_header) - 20 # -20 for truncation msg
+                 remaining_chars = max_chars_per_pdf - current_chars - len(page_header) - 20
                  if remaining_chars > 0:
                      text_content += page_header + page_text[:remaining_chars] + "... [Page Truncated]\n\n"
                  truncated = True
-                 break # Stop processing further pages
+                 break
             else:
                  text_content += page_header + page_text + "\n\n"
                  current_chars += page_text_len
-
         doc.close()
-
         if truncated:
-             text_content += "\n[PDF content truncated due to length limit. Only first ~20k characters extracted.]"
-
+             text_content += "\n[PDF content truncated due to length limit.]"
         return text_content.strip()
     except Exception as e:
-        print(f"[PDF Extract] Error extracting PDF content from {pdf_path}: {e}")
+        print(f"[PDF Extract] Error: {e}")
         traceback.print_exc()
         return f"Error extracting content from PDF '{os.path.basename(pdf_path)}': {str(e)}"
 
-
-def select_file():
-    """Opens dialog to select any supported file type (runs in main thread)."""
-    global selected_image_path, image_sent_in_history, window, user_input_widget
-    try:
-        file_path = filedialog.askopenfilename(
-            title="Select File Attachment",
-            filetypes=[
-                ("Supported Files", "*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.pdf;*.txt;*.md;*.py;*.js;*.html;*.css;*.json;*.log"),
-                ("Image files", "*.png;*.jpg;*.jpeg;*.gif;*.bmp"),
-                ("PDF files", "*.pdf"),
-                ("Text files", "*.txt;*.md;*.py;*.js;*.html;*.css;*.json;*.log"),
-                ("All files", "*.*")
-            ]
-        )
-    except Exception as fd_err:
-        print(f"[File Dialog] Error opening file dialog: {fd_err}")
-        add_message_to_ui("error", "Could not open file selection dialog.")
-        return
-
-    if file_path:
-        process_selected_file(file_path)
-
-def process_selected_file(file_path):
-    """Processes a file selected via dialog or dropped (runs in main thread)."""
-    global selected_image_path, image_sent_in_history, window, user_input_widget
-    if not file_path or not os.path.isfile(file_path):
-        print(f"[File Process] Invalid file path provided: {file_path}")
-        return
-
+def process_uploaded_file(file_path):
+    """Processes the uploaded file, returns content or None for images."""
+    global selected_file_path, selected_file_type, file_processed_for_input
+    
     file_name = os.path.basename(file_path)
     file_ext = os.path.splitext(file_path)[1].lower()
-    print(f"[File Process] Processing file: {file_name} (ext: {file_ext})")
+    content_for_input = None # Content to potentially prepend to user message
+    file_processed_for_input = False # Reset flag
 
-    # --- Handle Image Files ---
-    if file_ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
-        selected_image_path = file_path
-        image_sent_in_history = False # Reset flag for new image
+    print(f"[File Process] Processing uploaded file: {file_name}")
+
+    # Determine file type using mimetype guess first, fallback to extension
+    mtype, _ = mimetypes.guess_type(file_path)
+    guessed_type = mtype.split('/')[0] if mtype else None # 'image', 'text', 'application' etc.
+
+    if guessed_type == 'image' or file_ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
+        selected_file_path = file_path
+        selected_file_type = 'image'
+        send_status_to_web(f"Image '{file_name}' attached.")
+        print(f"[File Process] Type: Image")
+        # Images are handled separately, no content returned for input box
+
+    elif guessed_type == 'application' and file_ext == '.pdf':
+        selected_file_path = file_path
+        selected_file_type = 'pdf'
+        send_status_to_web(f"Processing PDF '{file_name}'...")
+        print(f"[File Process] Type: PDF")
+        content_for_input = extract_pdf_content(file_path)
+        file_processed_for_input = True
+        send_status_to_web(f"PDF '{file_name}' content extracted.")
+
+    elif guessed_type == 'text' or file_ext in ['.txt', '.md', '.py', '.js', '.html', '.css', '.json', '.log', '.csv', '.xml', '.yaml', '.ini', '.sh', '.bat']:
+        selected_file_path = file_path
+        selected_file_type = 'text'
+        send_status_to_web(f"Loading text file '{file_name}'...")
+        print(f"[File Process] Type: Text")
         try:
-            update_image_preview(file_path)
-            image_indicator.config(text=f"✓ Img: {file_name[:20]}{'...' if len(file_name)>20 else ''}")
-            add_message_to_ui("status", f"Image '{file_name}' attached.")
-        except Exception as img_err:
-            print(f"[File Process] Error processing image {file_name}: {img_err}")
-            add_message_to_ui("error", f"Failed to load image: {file_name}")
-            clear_image() # Clear preview on error
-
-    # --- Handle PDF Files ---
-    elif file_ext == '.pdf':
-        add_message_to_ui("status", f"Loading PDF: {file_name}...")
-        if 'window' in globals() and window: window.update_idletasks() # Update UI
-
-        # Extract content in a separate thread to avoid freezing UI
-        def extract_and_update():
-            try:
-                content = extract_pdf_content(file_path)
-                # Update UI in main thread
-                if window and window.winfo_exists():
-                     window.after(0, update_input_with_text_content, content, file_name, "PDF")
-            except Exception as pdf_thread_err:
-                 print(f"[PDF Thread] Error in PDF extraction thread: {pdf_thread_err}")
-                 if window and window.winfo_exists():
-                      window.after(0, lambda: add_message_to_ui("error", f"Error processing PDF {file_name}"))
-
-        thread = threading.Thread(target=extract_and_update, daemon=True)
-        thread.start()
-
-    # --- Handle Text Files ---
-    elif file_ext in ['.txt', '.md', '.py', '.js', '.html', '.css', '.json', '.log', '.csv', '.xml', '.yaml', '.ini', '.sh', '.bat']:
-         add_message_to_ui("status", f"Loading text file: {file_name}...")
-         if 'window' in globals() and window: window.update_idletasks()
-
-         def load_text_and_update():
-             try:
-                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f: # Use errors='ignore' for robustness
-                     content = f.read()
-                 # Truncate if very long
-                 max_len = 20000
-                 if len(content) > max_len:
-                     content = content[:max_len] + f"\n\n[--- Content truncated at {max_len} characters ---]"
-
-                 # Update UI in main thread
-                 if window and window.winfo_exists():
-                     window.after(0, update_input_with_text_content, content, file_name, "Text")
-             except Exception as e:
-                 print(f"[Text Load] Error loading text file {file_name}: {e}")
-                 if window and window.winfo_exists():
-                      window.after(0, lambda: add_message_to_ui("error", f"Error loading text file: {e}"))
-
-         thread = threading.Thread(target=load_text_and_update, daemon=True)
-         thread.start()
-         
-    # --- Handle other files as plain text (optional) ---
-    else:
-         print(f"[File Process] Unsupported file type '{file_ext}' for specific handling. Trying to load as text.")
-         add_message_to_ui("status", f"Loading file as text: {file_name}...")
-         if 'window' in globals() and window: window.update_idletasks()
-         
-         def load_generic_text_and_update():
-             try:
-                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                     content = f.read()
-                 max_len = 10000 # Shorter limit for generic files
-                 if len(content) > max_len:
-                     content = content[:max_len] + f"\n\n[--- Content truncated at {max_len} characters ---]"
-                 if window and window.winfo_exists():
-                     window.after(0, update_input_with_text_content, content, file_name, "File")
-             except Exception as e:
-                 print(f"[Generic Load] Error loading file {file_name} as text: {e}")
-                 if window and window.winfo_exists():
-                     window.after(0, lambda: add_message_to_ui("error", f"Could not load file {file_name} as text."))
-
-         thread = threading.Thread(target=load_generic_text_and_update, daemon=True)
-         thread.start()
-
-
-def update_input_with_text_content(content, file_name, file_type="File"):
-    """Updates the user input with extracted text content (runs in main thread)."""
-    global user_input_widget, window
-    if not user_input_widget: return
-
-    try:
-        # Prepare header
-        header = f"--- Content from {file_type}: {file_name} ---\n"
-        full_content = header + content + f"\n--- End of {file_name} Content ---"
-
-        # Clear current content and insert new
-        user_input_widget.delete("1.0", tk.END)
-        user_input_widget.insert("1.0", full_content)
-        user_input_widget.see("1.0") # Scroll to top
-        user_input_widget.update_idletasks()
-
-        # Notify user
-        add_message_to_ui("status", f"{file_type} content from '{file_name}' loaded into input area.")
-        print(f"[UI Update] {file_type} content loaded into input: {file_name}")
-
-    except tk.TclError as e:
-         print(f"[UI Update] Error updating input widget (maybe closed?): {e}")
-    except Exception as e:
-         print(f"[UI Update] Unexpected error updating input with text content: {e}")
-         traceback.print_exc()
-
-
-def paste_image_from_clipboard(event=None):
-    """Pastes an image from the clipboard (runs in main thread)."""
-    global selected_image_path, image_sent_in_history, window
-    try:
-        # Use Pillow's ImageGrab (requires Pillow installation)
-        from PIL import ImageGrab
-        clipboard_content = ImageGrab.grabclipboard()
-
-        if clipboard_content is None:
-            # print("[Paste] No image found in clipboard (clipboard_content is None).")
-            # add_message_to_ui("status", "Clipboard does not contain an image.")
-            return # Don't interfere with text paste
-        
-        # Check if it's an image object (PIL/Pillow)
-        if isinstance(clipboard_content, Image.Image):
-             img = clipboard_content
-             print("[Paste] Image found in clipboard.")
-             
-             # Save to temporary file
-             temp_file = tempfile.NamedTemporaryFile(prefix="pasted_img_", suffix=".png", delete=False)
-             temp_path = temp_file.name
-             temp_file.close()
-
-             try:
-                 img.save(temp_path, "PNG")
-             except Exception as save_err:
-                 print(f"[Paste] Error saving clipboard image to {temp_path}: {save_err}")
-                 add_message_to_ui("error", "Failed to save pasted image.")
-                 if os.path.exists(temp_path): os.unlink(temp_path) # Clean up failed attempt
-                 return
-
-             # Update application state
-             selected_image_path = temp_path
-             image_sent_in_history = False
-
-             # Update UI
-             update_image_preview(temp_path)
-             image_indicator.config(text=f"✓ Pasted image")
-             add_message_to_ui("status", f"Image pasted from clipboard.")
-             print(f"[Paste] Image saved to {temp_path}")
-             return "break" # Indicate we handled the paste event (for image)
-
-        # Handle case where clipboard contains file paths (e.g., copied file in Explorer)
-        elif isinstance(clipboard_content, list) and len(clipboard_content) > 0:
-             # Check if the first item is a valid image file path
-             file_path = clipboard_content[0]
-             if isinstance(file_path, str) and os.path.isfile(file_path):
-                 file_ext = os.path.splitext(file_path)[1].lower()
-                 if file_ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
-                     print(f"[Paste] Image file path found in clipboard: {file_path}")
-                     process_selected_file(file_path) # Use the common file processing function
-                     return "break" # Indicate handled
-
-        # If it's not an image or recognized file path, let text paste proceed
-        # print("[Paste] Clipboard content is not a direct image or recognized file path.")
-        return None # Allow default paste behavior
-
-    except ImportError:
-         print("[Paste] Error: Pillow library not found. Cannot paste images. `pip install Pillow`")
-         add_message_to_ui("error", "Pillow library needed for image pasting.")
-         return None
-    except Exception as e:
-        # Catch tkdnd specific errors or others
-        if "bad screen distance" in str(e): # Example of specific error handling
-             print(f"[Paste] Tkinter error during paste (potential focus issue): {e}")
-        else:
-             print(f"[Paste] Error pasting image: {e}")
-             traceback.print_exc()
-        # add_message_to_ui("error", f"Failed to paste image: {e}")
-        return None # Allow default behavior on error
-
-
-def setup_paste_binding():
-    """Sets up the keyboard binding for paste (runs in main thread)."""
-    # Bind Ctrl+V / Cmd+V to the main window and input widget
-    # The event handler will try to paste an image first.
-    # If it returns None, Tkinter's default text paste proceeds.
-    # If it returns "break", default paste is suppressed.
-    if window and user_input_widget:
-         # Use a lambda to pass the event object correctly
-         paste_handler = lambda event: paste_image_from_clipboard(event)
-         
-         # Bind to user input widget (higher priority for focus)
-         user_input_widget.bind("<Control-v>", paste_handler)
-         user_input_widget.bind("<Command-v>", paste_handler) # Mac
-
-         # Bind to main window as a fallback (might catch paste when input isn't focused)
-         # window.bind("<Control-v>", paste_handler)
-         # window.bind("<Command-v>", paste_handler) # Mac
-         print("[UI] Paste bindings (Ctrl+V / Cmd+V) set up.")
-    else:
-         print("[UI] Error: Could not set up paste bindings (window or input widget not ready).")
-
-# --- Drag and Drop Handlers (Main Thread) ---
-
-def handle_file_drop(event):
-    """Generic handler for files dropped onto registered widgets."""
-    # Extract file path(s) from the event data
-    # TkinterDnD usually provides paths enclosed in curly braces {} if they contain spaces
-    raw_path_data = event.data.strip()
-    # Simple parsing: remove braces and handle potential multiple files (take first)
-    if raw_path_data.startswith('{') and raw_path_data.endswith('}'):
-         file_path = raw_path_data[1:-1]
-    else:
-         file_path = raw_path_data
-         
-    # Rudimentary check for multiple files (split by space if not braced)
-    # This is not foolproof for all filenames but covers common cases.
-    potential_files = file_path.split()
-    if len(potential_files) > 1 and not raw_path_data.startswith('{'):
-        # Check if the first part looks like a valid file
-        if os.path.isfile(potential_files[0]):
-             file_path = potential_files[0]
-             print(f"[Drop] Multiple files detected, processing first: {file_path}")
-        else:
-             # Fallback to the whole string if first part isn't a file (might be filename with spaces)
-             print(f"[Drop] Ambiguous drop data, processing as single path: {file_path}")
-    
-    # Process the determined single file path
-    if file_path and os.path.isfile(file_path):
-         print(f"[Drop] File dropped: {file_path}")
-         # Use the common processing function
-         process_selected_file(file_path)
-
-         # Provide visual feedback on the drop target widget
-         widget = event.widget
-         try:
-             original_bg = widget.cget("background")
-             widget.config(bg="#90EE90") # Light green feedback
-             # Use schedule to revert color after a delay
-             if window and window.winfo_exists():
-                 window.after(500, lambda w=widget, bg=original_bg: w.config(bg=bg))
-         except tk.TclError: # Handle cases where widget background cannot be configured (e.g., some ttk widgets)
-             pass
-         except Exception as e:
-             print(f"[Drop] Error providing visual feedback: {e}")
-             
-    else:
-         print(f"[Drop] Ignored drop event: Data does not seem to be a valid file path: '{event.data}'")
-
-# --- Whisper Language/Model Setters (Main Thread) ---
-
-def set_whisper_language(event=None):
-    """Sets the language for Whisper transcription."""
-    global whisper_language, whisper_language_selector
-    # Check if selector exists and has a valid selection
-    if 'whisper_language_selector' in globals() and hasattr(whisper_language_selector, 'current'):
-        selected_idx = whisper_language_selector.current()
-        if selected_idx >= 0 and selected_idx < len(WHISPER_LANGUAGES):
-             lang_name, lang_code = WHISPER_LANGUAGES[selected_idx]
-             if whisper_language != lang_code: # Only print if changed
-                 whisper_language = lang_code
-                 print(f"[Whisper] Language set to: {lang_name} ({whisper_language})")
-        else:
-            print(f"[Whisper] Invalid language selection index: {selected_idx}")
-    else:
-         print("[Whisper] Language selector not ready.")
-
-
-def set_whisper_model_size(event=None):
-    """Sets Whisper model size and triggers re-initialization if needed."""
-    global whisper_model_size, whisper_model_size_selector, whisper_initialized, whisper_model
-    if 'whisper_model_size_selector' not in globals():
-         print("[Whisper] Model size selector not ready.")
-         return
-         
-    new_size = whisper_model_size_selector.get()
-    if not new_size: # Handle empty selection if possible
-         print("[Whisper] No model size selected.")
-         return
-
-    if new_size == whisper_model_size and whisper_initialized:
-        # print(f"[Whisper] Model size '{new_size}' already selected and initialized.")
-        return # No change needed
-
-    print(f"[Whisper] Model size changed to: {new_size}. Re-initialization required.")
-
-    # Update global state
-    whisper_model_size = new_size
-    whisper_initialized = False # Force re-initialization
-    
-    # Release old model reference to allow garbage collection
-    if whisper_model:
-        print("[Whisper] Releasing old model object...")
-        # Explicit deletion might help, especially with GPU memory in some frameworks
-        try:
-            del whisper_model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache() # Try to free CUDA memory if applicable
-        except Exception as del_err:
-            print(f"[Whisper] Error during old model cleanup: {del_err}")
-        whisper_model = None
-
-    # If voice recognition is currently enabled, trigger immediate re-initialization
-    if voice_enabled and voice_enabled.get():
-        print("[Whisper] Voice enabled, attempting immediate re-initialization...")
-        initialize_whisper() # This will load the new model and update status label
-    else:
-        # If voice is disabled, just note that re-init will happen when enabled
-        update_vad_status(f"Model set to {new_size}", "blue") # Show selection change
-        print(f"[Whisper] Model set to {new_size}. Will initialize when voice is enabled.")
-
-
-def update_vad_status(text, color):
-    """Safely updates the VAD status label from any thread (schedules on main thread)."""
-    global recording_indicator_widget, window
-    if recording_indicator_widget and window and window.winfo_exists():
-        try:
-            # Use schedule to run on main thread
-            window.after(0, lambda w=recording_indicator_widget, t=text, c=color: w.config(text=t, fg=c))
-        except tk.TclError as e:
-            # Handle case where window might be closing while after() is pending
-            if "application has been destroyed" not in str(e):
-                 print(f"[UI Status] TclError updating VAD status (widget likely destroyed): {e}")
-        except Exception as e:
-             print(f"[UI Status] Error updating VAD status: {e}")
-
-
-# ===================
-# Ollama / Chat Logic
-# ===================
-def fetch_available_models():
-    """Fetches available Ollama models (robust parsing)."""
-    try:
-        print("[Ollama Fetch] Calling ollama.list()...")
-        models_data = ollama.list()
-        print(f"[Ollama Fetch] Received raw data type: {type(models_data)}")
-        # print(f"[Ollama Fetch] Raw data: {models_data}") # Uncomment for deep debugging if needed
-        
-        valid_models = []
-
-        # --- NEW: Check for object with 'models' attribute containing Model objects ---
-        if hasattr(models_data, 'models') and isinstance(models_data.models, list):
-            print("[Ollama Fetch] Parsing as object with 'models' list attribute...")
-            for model_obj in models_data.models:
-                if hasattr(model_obj, 'model') and isinstance(model_obj.model, str):
-                    valid_models.append(model_obj.model)
-                elif hasattr(model_obj, 'name') and isinstance(model_obj.name, str): # Backup check for 'name' attribute
-                     valid_models.append(model_obj.name)
-                else:
-                    print(f"[Ollama Fetch] Warning: Model object missing 'model' or 'name' string attribute: {model_obj}")
-            if valid_models:
-                 print(f"[Ollama Fetch] Successfully parsed {len(valid_models)} models via object attribute.")
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            max_len = 20000
+            if len(content) > max_len:
+                content_for_input = content[:max_len] + f"\n\n[--- Content truncated at {max_len} characters ---]"
             else:
-                 print("[Ollama Fetch] Parsed object attribute, but found no valid model names.")
-
-
-        # --- Fallback: Check for dictionary structure (older versions?) ---
-        elif isinstance(models_data, dict) and 'models' in models_data:
-            print("[Ollama Fetch] Parsing as dictionary with 'models' key...")
-            models_list = models_data.get('models', [])
-            if isinstance(models_list, list):
-                for model_info in models_list:
-                    if isinstance(model_info, dict) and 'name' in model_info:
-                        valid_models.append(model_info['name'])
-                    else:
-                        print(f"[Ollama Fetch] Warning: Skipping unexpected model entry format in dict: {model_info}")
-                if valid_models:
-                    print(f"[Ollama Fetch] Successfully parsed {len(valid_models)} models via dictionary key.")
-                else:
-                     print("[Ollama Fetch] Parsed dictionary key, but found no valid model names.")
-            else:
-                print("[Ollama Fetch] Warning: 'models' key does not contain a list in dictionary.")
-
-        # --- Fallback: Check for direct list of strings/dicts ---
-        elif isinstance(models_data, list):
-             print("[Ollama Fetch] Parsing as direct list...")
-             for item in models_data:
-                  if isinstance(item, str):
-                       valid_models.append(item)
-                  elif isinstance(item, dict) and 'name' in item:
-                       valid_models.append(item['name'])
-             if valid_models:
-                  print(f"[Ollama Fetch] Successfully parsed {len(valid_models)} models via direct list.")
-             else:
-                  print("[Ollama Fetch] Parsed direct list, but found no valid model names.")
-
-        # --- Handle No Models Found ---
-        if not valid_models:
-             print("[Ollama Fetch] No valid models identified after parsing attempts.")
-             print(f"[Ollama Fetch] Final raw data received was: {models_data}")
-             # Provide common fallbacks
-             valid_models = [DEFAULT_OLLAMA_MODEL, "llama3:8b", "phi3:mini", "gemma:7b"]
-             print(f"[Ollama Fetch] Returning fallback models: {valid_models}")
-             return valid_models # Return fallbacks
-
-        # Sort models for better UI presentation
-        valid_models.sort()
-        print(f"[Ollama Fetch] Found and sorted models: {valid_models}")
-        return valid_models
-
-    except Exception as e:
-        print(f"[Ollama Fetch] Error during ollama.list() or parsing: {e}")
-        traceback.print_exc()
-        # Use schedule to add error to UI safely if window exists
-        if 'window' in globals() and window and window.winfo_exists():
-             window.after(0, lambda: add_message_to_ui("error", f"Could not fetch Ollama models: {e}. Check Ollama status."))
-        # Provide common fallbacks if API fails
-        fallbacks = [DEFAULT_OLLAMA_MODEL, "llama3:8b", "phi3:mini", "gemma:7b"]
-        print(f"[Ollama Fetch] Returning fallback models due to error: {fallbacks}")
-        return fallbacks
-
-def chat_worker(user_message_content, image_path=None):
-    """Background worker for Ollama streaming chat (Thread-safe history)."""
-    global messages, messages_lock, current_model, stream_queue, stream_done_event, stream_in_progress
-    global web_output_queue # (Phase 2) Access web output queue
-
-    # Construct the message with potential image
-    current_message = {"role": "user", "content": user_message_content}
-    image_bytes = None # Store bytes if image is processed successfully
-    image_error = None # Store error if image processing fails
-
-    if image_path:
-        try:
-            print(f"[Chat Worker] Reading image file: {image_path}")
-            # Read the image as bytes - Ollama Python library expects bytes
-            with open(image_path, 'rb') as f:
-                image_bytes = f.read()
-            # Only add 'images' key if bytes were read successfully
-            current_message["images"] = [image_bytes] # Use the read bytes
-            print(f"[Chat Worker] Image bytes loaded ({len(image_bytes)} bytes).")
-        except FileNotFoundError:
-             image_error = f"Error: Image file not found at '{image_path}'"
+                 content_for_input = content
+            file_processed_for_input = True
+            send_status_to_web(f"Text file '{file_name}' content loaded.")
         except Exception as e:
-            image_error = f"Error reading image file '{os.path.basename(image_path)}': {e}"
-            print(f"[Chat Worker] {image_error}")
+            print(f"[File Process] Error reading text file {file_name}: {e}")
+            send_error_to_web(f"Error reading text file '{file_name}': {e}")
+            # Keep file selected but indicate error
+            selected_file_path = file_path
+            selected_file_type = 'text_error' # Special type?
 
-    # --- Handle Image Errors ---
-    if image_error:
-         # Put error message on both queues (UI and Web)
-         stream_queue.put(("ERROR", image_error))
-         web_output_queue.put({"type": "error", "content": image_error}) # (Phase 2)
-         # Don't add user message to history if image failed critically before sending
-         stream_in_progress = False
-         stream_done_event.set()
-         return # Stop processing
+    else: # Unsupported type
+        print(f"[File Process] Unsupported file type: {file_name} (Type: {mtype}, Ext: {file_ext})")
+        send_error_to_web(f"Unsupported file type: '{file_name}'. Cannot attach.")
+        # Clear selection
+        selected_file_path = None
+        selected_file_type = None
+        if os.path.exists(file_path): # Clean up the unsupported upload
+             try: os.unlink(file_path)
+             except: pass
+        return None # Indicate failure
 
-    # --- Update Shared History (Thread-Safe) ---
+    # Return content only if it was extracted (PDF/Text)
+    return content_for_input if file_processed_for_input else None
+
+# ============================================================================
+# Ollama Chat Logic (Adapted for web)
+# ============================================================================
+
+def get_current_chat_history():
+    """Safely gets a copy of the chat history, filtering image data."""
+    with messages_lock:
+        history_copy = []
+        for msg in messages:
+            msg_copy = msg.copy()
+            if "images" in msg_copy:
+                 # Replace image bytes with a placeholder for history view
+                 img_count = len(msg_copy.get("images", []))
+                 placeholder = f" [Image Attachment ({img_count})]"
+                 if msg_copy.get("content"):
+                     msg_copy["content"] += placeholder
+                 else:
+                     msg_copy["content"] = placeholder
+                 del msg_copy["images"]
+            history_copy.append(msg_copy)
+        return history_copy
+
+def run_chat_interaction(user_message_content):
+    """Starts the Ollama chat interaction in a background thread."""
+    global stream_in_progress, selected_file_path, selected_file_type, file_processed_for_input
+    global tts_sentence_buffer, tts_queue, tts_busy, tts_busy_lock, tts_engine
+
+    # Prevent concurrent Ollama requests
+    if not ollama_lock.acquire(blocking=False):
+        send_error_to_web("Ollama is already processing a request. Please wait.")
+        return
+
+    stream_in_progress = True # Set flag immediately after acquiring lock
+
+    # --- Prepare message and image ---
+    image_path_to_send = None
+    if selected_file_path and selected_file_type == 'image':
+        image_path_to_send = selected_file_path
+        print(f"[Chat Start] Including image: {os.path.basename(image_path_to_send)}")
+
+    final_user_content = user_message_content
+    
+    # If a PDF/Text file was processed, prepend its content (if not already done implicitly)
+    # This logic might be handled by frontend now, but keep for backend processing possibility
+    # if file_processed_for_input and selected_file_type in ['pdf', 'text']:
+    #    # Logic to potentially prepend file content header, or assume it's in user_message_content
+    #    pass 
+
+
+    # --- Add user message to history (thread-safe) ---
+    # Construct the message object *before* locking
+    user_msg_obj = {"role": "user", "content": final_user_content}
+    # Add placeholder if image is being sent with this message
+    if image_path_to_send:
+         img_placeholder = f" [Image: {os.path.basename(image_path_to_send)}]"
+         if user_msg_obj["content"]:
+              user_msg_obj["content"] += img_placeholder
+         else: # Handle image-only message
+              user_msg_obj["content"] = img_placeholder.strip()
+
+
     try:
         with messages_lock:
-            messages.append(current_message)
-            # Make a copy for this request to avoid modification during iteration
-            history_for_ollama = list(messages)
-            # Important: Remove raw image bytes from history sent to Ollama if model doesn't support it or for efficiency
-            # Ollama library *should* handle the 'images' key correctly, but let's keep the history lean.
-            # The current message *sent* to ollama.chat() will contain the image.
-            # The history list (`messages`) retains it for potential future context if needed.
-            # Let's modify the copy sent, not the global `messages` here.
-            history_copy_for_request = []
-            for msg in history_for_ollama:
-                msg_copy = msg.copy()
-                if "images" in msg_copy:
-                     # Keep 'images' key only for the *very last* message if sending image now
-                     if msg is not current_message:
-                          del msg_copy["images"] # Remove image bytes from past messages in request history
-                     # Optionally, replace with placeholder for older messages:
-                     # else: msg_copy['content'] += " [Image was attached]"
-                history_copy_for_request.append(msg_copy)
-
+            messages.append(user_msg_obj) # Add message without image bytes to history
+        # Send history update via SSE AFTER releasing lock
+        web_output_queue.put({"type": "history_update", "data": get_current_chat_history()})
     except Exception as lock_err:
-         err_text = f"Error accessing chat history (lock): {lock_err}"
-         print(f"[Chat Worker] {err_text}")
-         stream_queue.put(("ERROR", err_text))
-         web_output_queue.put({"type": "error", "content": err_text}) # (Phase 2)
+         print(f"[Chat Start] Error adding user message to history: {lock_err}")
+         send_error_to_web("Failed to update chat history.")
          stream_in_progress = False
-         stream_done_event.set()
+         ollama_lock.release()
          return
 
-    # --- Call Ollama API ---
-    assistant_response = "" # Accumulate full response for history
-    try:
-        print(f"[Chat Worker] Sending request to model {current_model}...")
-        # Debug: Print messages being sent
-        # print("[Chat Worker] Messages Sent:", history_copy_for_request)
 
-        stream = ollama.chat(
-            model=current_model,
-            messages=history_copy_for_request, # Send the potentially modified history copy
-            stream=True
-        )
-
-        first_chunk = True
-        for chunk in stream:
-            # Check for stop signal (e.g., from main thread if needed, less common here)
-            # if stop_event.is_set(): break
-
-            if 'message' in chunk and 'content' in chunk['message']:
-                content_piece = chunk['message']['content']
-                if first_chunk:
-                     # Signal start only once
-                     stream_queue.put(("START", None))
-                     web_output_queue.put({"type": "start"}) # (Phase 2) Signal web UI too
-                     first_chunk = False
-                
-                # Send chunk to both queues
-                stream_queue.put(("CHUNK", content_piece))
-                web_output_queue.put({"type": "chunk", "content": content_piece}) # (Phase 2)
-
-                assistant_response += content_piece # Accumulate for history
-
-            # Check for errors within the stream
-            if 'error' in chunk:
-                 err_text = f"Ollama stream error: {chunk['error']}"
-                 print(f"[Chat Worker] {err_text}")
-                 stream_queue.put(("ERROR", err_text))
-                 web_output_queue.put({"type": "error", "content": err_text}) # (Phase 2)
-                 assistant_response = None # Indicate error occurred, don't save partial response
-                 break # Stop processing on stream error
-
-            # Check for 'done' status (alternative way stream might end)
-            if chunk.get('done', False):
-                 print("[Chat Worker] Stream finished (received 'done' flag).")
-                 break # Exit loop gracefully if Ollama signals done
-
-        # --- After successful streaming ---
-        if assistant_response is not None: # Check if error occurred mid-stream
-             # Add the complete assistant response to shared history (thread-safe)
-             try:
-                 with messages_lock:
-                     messages.append({"role": "assistant", "content": assistant_response})
-                 print(f"[Chat Worker] Assistant response added to history ({len(assistant_response)} chars).")
-             except Exception as lock_err:
-                 # Log error, but don't send to UI again if stream ended ok
-                 print(f"[Chat Worker] Error adding assistant response to history (lock): {lock_err}")
-
-             # Signal end to both queues
-             stream_queue.put(("END", None))
-             web_output_queue.put({"type": "end"}) # (Phase 2)
-
-    except ollama.ResponseError as ore:
-         err_text = f"Ollama API Response Error: {ore.status_code} - {ore.error}"
-         print(f"[Chat Worker] {err_text}")
-         stream_queue.put(("ERROR", err_text))
-         web_output_queue.put({"type": "error", "content": err_text}) # (Phase 2)
-    except Exception as e:
-        err_text = f"Ollama communication error: {e}"
-        print(f"[Chat Worker] {err_text}")
-        traceback.print_exc()
-        stream_queue.put(("ERROR", err_text))
-        web_output_queue.put({"type": "error", "content": err_text}) # (Phase 2)
-    finally:
-        # --- Finalization ---
-        stream_in_progress = False
-        stream_done_event.set() # Signal completion/error to main thread
-        print("[Chat Worker] Worker finished.")
-
-
-def process_stream_queue():
-    """Processes items from Ollama stream queue for UI and TTS (runs in main thread)."""
-    global stream_queue, chat_history_widget, tts_sentence_buffer, stream_in_progress, window
-
-    if not stream_in_progress: # Optimization: Don't poll if nothing is expected
-         return
-
-    try:
-        while True: # Process all available items without blocking
-            item_type, item_data = stream_queue.get_nowait()
-
-            if item_type == "START":
-                 # Optional: Clear "Thinking..." message here if needed,
-                 # but usually handled when first chunk arrives or in send_message().
-                 print("[Stream Processor] Received START signal.")
-                 pass # Placeholder
-                 
-            elif item_type == "CHUNK":
-                # Append chunk to UI
-                if chat_history_widget:
-                    try:
-                        chat_history_widget.config(state=tk.NORMAL)
-                        chat_history_widget.insert(tk.END, item_data, "bot_message")
-                        chat_history_widget.config(state=tk.DISABLED)
-                        chat_history_widget.see(tk.END) # Auto-scroll
-                    except tk.TclError as ui_err:
-                        print(f"[Stream Processor] Error updating UI (widget destroyed?): {ui_err}")
-                else:
-                     print("[Stream Processor] Warning: chat_history_widget not available for chunk.")
-                     
-                # Queue text for TTS
-                queue_tts_text(item_data)
-                
-            elif item_type == "END":
-                print("[Stream Processor] Received END signal.")
-                # Add final newline for spacing in chat history
-                if chat_history_widget:
-                     try:
-                         chat_history_widget.config(state=tk.NORMAL)
-                         chat_history_widget.insert(tk.END, "\n\n", "bot_message") # Ensure spacing
-                         chat_history_widget.config(state=tk.DISABLED)
-                         chat_history_widget.see(tk.END)
-                     except tk.TclError as ui_err:
-                         print(f"[Stream Processor] Error adding final newline (widget destroyed?): {ui_err}")
-                         
-                # Flush any remaining partial sentence in TTS buffer
-                queue_tts_text("\n") # Add newline to help flush
-                try_flush_tts_buffer()
-                # Note: stream_in_progress is reset by chat_worker or check_done
-                return # Stop polling loop for this response
-
-            elif item_type == "ERROR":
-                 print(f"[Stream Processor] Received ERROR signal: {item_data}")
-                 add_message_to_ui("error", item_data)
-                 # Ensure stream_in_progress is reset (should be done by worker, but defensive)
-                 stream_in_progress = False
-                 return # Stop polling loop
-
-    except queue.Empty:
-        # No more items in queue right now
-        pass
-    except Exception as e:
-         print(f"[Stream Processor] Error processing stream queue: {e}")
-         traceback.print_exc()
-         stream_in_progress = False # Stop polling on unexpected error
-
-    # Reschedule polling ONLY if stream is still marked as in progress
-    # and the window still exists
-    if stream_in_progress and window and window.winfo_exists():
-        window.after(100, process_stream_queue) # Check again in 100ms
-
-
-# =================================
-# Web Input Queue Processing (Phase 2)
-# =================================
-
-def check_web_input_queue():
-    """Periodically check the queue for messages from the Flask web UI."""
-    global web_input_queue, window, user_input_widget
-
-    try:
-        # Process all messages currently in the queue
-        while True:
-            message_data = web_input_queue.get_nowait()
-            print(f"[Main] Processing message from web queue: {message_data}")
-
-            msg_type = message_data.get("type")
-
-            if msg_type == "text_message":
-                content = message_data.get("content", "").strip()
-                if content:
-                    # --- Refactored approach: Call core send logic directly ---
-                    # process_user_message(content, source="web") # Needs refactoring send_message
-
-                    # --- Alternative: Simulate GUI interaction (simpler initially) ---
-                    if user_input_widget:
-                        try:
-                             print(f"[Main] Simulating GUI input for web message: '{content[:50]}...'")
-                             user_input_widget.delete("1.0", tk.END) # Clear GUI input
-                             user_input_widget.insert("1.0", content) # Put text in GUI input
-                             send_message() # Trigger the existing send logic from GUI
-                        except tk.TclError as e:
-                             print(f"[Main] Error interacting with GUI for web message: {e}")
-                             add_message_to_ui("error", f"Failed to process web message in UI: {e}")
-                    else:
-                         print("[Main] Error: User input widget not available for web message.")
-
-            # Handle other message types from web if needed later
-            # elif msg_type == "set_model":
-            #     model_name = message_data.get("model")
-            #     # ... logic to update model ...
-
-            web_input_queue.task_done() # Mark task as complete
-
-    except queue.Empty:
-        pass # No message from web UI this time
-    except Exception as e:
-        print(f"[Main] Error processing web input queue: {e}")
-        traceback.print_exc()
-    finally:
-        # Reschedule the check if the window still exists
-        if window and window.winfo_exists():
-            window.after(300, check_web_input_queue) # Check every 300ms
-
-
-# ===================
-# UI Helpers
-# ===================
-
-def clear_image():
-    """Clears the selected image."""
-    global selected_image_path, image_sent_in_history, image_preview, image_indicator
-    selected_image_path = ""
-    image_sent_in_history = False # Allow sending next time
-    if image_preview:
-        image_preview.configure(image="", text="No Image", width=20, height=10, bg="lightgrey")
-        image_preview.image = None # Clear reference
-    if image_indicator:
-        image_indicator.config(text="No image attached")
-    print("[UI] Image selection cleared.")
-
-
-def update_image_preview(file_path):
-    """Updates the image preview label (runs in main thread)."""
-    global image_preview, window
-    if not image_preview or not window or not window.winfo_exists():
-        print("[UI] Image preview widget not ready.")
-        return
-
-    try:
-        img = Image.open(file_path)
-        # Resize for preview
-        max_size = 140 # Max width/height for preview
-        img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS) # Use Resampling for newer Pillow
-        
-        photo = ImageTk.PhotoImage(img)
-        image_preview.configure(image=photo, width=img.width, height=img.height, text="") # Clear text
-        image_preview.image = photo # Keep reference to avoid garbage collection
-        print(f"[UI] Image preview updated for: {os.path.basename(file_path)}")
-    except FileNotFoundError:
-        print(f"[UI] Error updating image preview: File not found - {file_path}")
-        clear_image()
-        image_indicator.config(text="File Not Found", fg="red")
-    except Exception as e:
-        print(f"[UI] Error updating image preview: {e}")
-        clear_image() # Reset if preview fails
-        if image_indicator: image_indicator.config(text="Preview Error", fg="red")
-
-
-def add_message_to_ui(role, content, tag_suffix=""):
-    """Adds a message to the chat history widget (thread-safe via `window.after`)."""
-    global chat_history_widget, window
-
-    if not content: # Don't add empty messages
-         # print("[UI] Skipping empty message.")
-         return
-    
-    # Ensure this runs on the main thread
-    if threading.current_thread() is not threading.main_thread():
-         if window and window.winfo_exists():
-              # print(f"[UI] Scheduling message add from thread: {role} - {content[:30]}...")
-              window.after(0, add_message_to_ui, role, content, tag_suffix)
-         else:
-              print("[UI] Warning: Window closed, cannot schedule message add.")
-         return
-
-    # --- Main thread execution ---
-    if not chat_history_widget:
-        print("[UI] Warning: chat_history_widget not ready.")
-        return
-        
-    try:
-        # Temporarily enable widget, add content, disable again
-        chat_history_widget.config(state=tk.NORMAL)
-
-        prefix = ""
-        tag = ""
-        content_tag = ""
-
-        if role == "user":
-            prefix = "You: "
-            tag = "user_tag"
-            content_tag = "user_message" + tag_suffix
-        elif role == "assistant":
-            # Note: Assistant messages are typically added chunk-by-chunk by process_stream_queue
-            # This might be used for non-streamed messages or status updates styled as assistant.
-            prefix = "Ollama: "
-            tag = "bot_tag"
-            content_tag = "bot_message" + tag_suffix
-        elif role == "error":
-            prefix = "Error: "
-            tag = "error" + tag_suffix
-            content_tag = tag # Use same tag for content
-        elif role == "status":
-            prefix = "" # Status messages might not need a prefix
-            tag = "status" + tag_suffix
-            content_tag = tag
-
-        # Insert prefix with its tag
-        if prefix:
-             chat_history_widget.insert(tk.END, prefix, tag)
-             
-        # Insert content with its tag, add spacing
-        chat_history_widget.insert(tk.END, content + "\n\n", content_tag)
-
-        # Auto-scroll to the end
-        chat_history_widget.see(tk.END)
-        chat_history_widget.config(state=tk.DISABLED)
-        
-        # Force UI update (optional, can sometimes cause minor flicker)
-        # window.update_idletasks()
-
-    except tk.TclError as e:
-        # Handle potential errors if the widget is destroyed mid-operation
-        if "application has been destroyed" not in str(e):
-             print(f"[UI] TclError adding message (widget likely destroyed): {e}")
-    except Exception as e:
-        print(f"[UI] Unexpected error adding message to UI: {e}")
-        traceback.print_exc()
-
-
-def select_model(event=None):
-    """Updates the selected Ollama model (runs in main thread)."""
-    global current_model, model_selector, model_status
-    if not model_selector: return # Not ready
-
-    selected = model_selector.get()
-    if selected and selected != "No models found":
-        if selected != current_model: # Only update if changed
-             current_model = selected
-             if model_status: model_status.config(text=f"Using: {current_model.split(':')[0]}") # Show base name
-             print(f"[Ollama] Model selected: {current_model}")
-             add_message_to_ui("status", f"Switched model to: {current_model}")
-    elif not selected:
-         print("[Ollama] No model selected in dropdown.")
-
-
-def send_message(event=None):
-    """Handles sending the user's message to Ollama (runs in main thread)."""
-    global messages, selected_image_path, image_sent_in_history
-    global stream_in_progress, stream_done_event, user_input_widget, chat_history_widget
-    global tts_sentence_buffer, tts_engine, tts_enabled, tts_queue, tts_busy, tts_busy_lock, send_button
-
-    # --- Input Validation ---
-    if stream_in_progress:
-        add_message_to_ui("error", "Please wait for the current response to complete.")
-        return
-
-    if not user_input_widget:
-         add_message_to_ui("error", "Input widget not available.")
-         return
-
-    user_text = user_input_widget.get("1.0", tk.END).strip()
-    # Determine image to send (only if it hasn't been sent *since it was last selected*)
-    image_to_send = selected_image_path if selected_image_path and not image_sent_in_history else None
-
-    if not user_text and not image_to_send:
-        add_message_to_ui("error", "Please enter a message or attach a new image.")
-        return
-
-    # --- Prepare for Sending ---
-    print("[UI] Preparing to send message...")
-    if send_button: send_button.config(state=tk.DISABLED) # Disable send button
-    stream_in_progress = True
-    stream_done_event.clear()
-
-    # --- Display User Message in UI ---
-    display_text = user_text
-    image_tag = ""
-    if image_to_send:
-        image_filename = os.path.basename(image_to_send)
-        image_tag = f" [Image: {image_filename[:20]}{'...' if len(image_filename)>20 else ''}]"
-        display_text += image_tag
-    
-    # Handle case where only image is sent
-    if not user_text and image_to_send:
-        display_text = image_tag.strip() # Use only the image tag as display text
-
-    add_message_to_ui("user", display_text)
-
-    # Clear input AFTER adding to UI
-    user_input_widget.delete("1.0", tk.END)
-
-    # --- Add "Thinking" Indicator ---
-    thinking_start_index = None
-    thinking_text = "Ollama: Thinking...\n"
-    if chat_history_widget:
-         try:
-             chat_history_widget.config(state=tk.NORMAL)
-             # Get index before inserting thinking text
-             thinking_start_index = chat_history_widget.index(tk.END + "-1c") # Index before the last implicit newline
-             chat_history_widget.insert(tk.END, thinking_text, ("bot_tag", "thinking"))
-             chat_history_widget.see(tk.END)
-             chat_history_widget.config(state=tk.DISABLED)
-             if window: window.update_idletasks()
-         except tk.TclError as e:
-              print(f"[UI] Error adding 'Thinking...' indicator: {e}")
-              thinking_start_index = None # Ensure it's None if failed
-         except Exception as e:
-              print(f"[UI] Unexpected error adding 'Thinking...' indicator: {e}")
-              thinking_start_index = None
-
-
-    # --- Stop any ongoing TTS and clear buffers ---
-    if tts_engine and tts_enabled and tts_enabled.get() and tts_initialized_successfully:
-        print("[UI] Stopping active TTS for new message...")
+    # --- Stop TTS ---
+    if tts_engine and tts_enabled_state and tts_initialized_successfully:
+        print("[Chat Start] Stopping active TTS...")
         try: tts_engine.stop()
-        except Exception as tts_stop_err: print(f"[TTS] Minor error stopping engine: {tts_stop_err}")
-        # Clear queue and buffer immediately
+        except: pass
         tts_sentence_buffer = ""
         while not tts_queue.empty():
             try: tts_queue.get_nowait()
             except queue.Empty: break
-        with tts_busy_lock: tts_busy = False # Reset busy state immediately
-        print("[UI] TTS queue and buffer cleared.")
+        with tts_busy_lock: tts_busy = False
 
-    # --- Start Ollama worker thread ---
-    print(f"[UI] Starting chat worker thread (Image: {'Yes' if image_to_send else 'No'})...")
-    thread = threading.Thread(target=chat_worker, args=(user_text, image_to_send), daemon=True)
+
+    # --- Start Worker Thread ---
+    print("[Chat Start] Starting Ollama worker thread...")
+    thread = threading.Thread(target=chat_worker, args=(final_user_content, image_path_to_send), daemon=True)
     thread.start()
 
-    # --- Update Image State ---
-    if image_to_send:
-        image_sent_in_history = True # Mark image as sent for this context
-        # Optional: Clear image selection automatically after sending
-        # clear_image() # Uncomment to automatically clear
-        # Optional: Update indicator text to show it was sent
-        if image_indicator: image_indicator.config(text=f"✓ Sent: {os.path.basename(image_to_send)[:20]}...")
+    # --- Reset file state after initiating the chat ---
+    # We assume the file was 'consumed' by this message send
+    selected_file_path = None
+    selected_file_type = None
+    file_processed_for_input = False
+    # Send state clear confirmation? Maybe not necessary unless frontend needs it.
 
-    # --- Set up check for worker completion ---
-    def check_done():
-        global stream_in_progress # Allow modification
-        if stream_done_event.is_set():
-            print("[UI] Worker thread signaled completion.")
-            stream_in_progress = False # Update state *before* UI changes
+def chat_worker(user_message_content, image_path=None):
+    """Background worker for Ollama streaming chat (releases lock on finish)."""
+    global messages, messages_lock, current_model, web_output_queue, stream_in_progress, ollama_lock
 
-            # --- Remove "Thinking..." message (carefully) ---
-            if thinking_start_index and chat_history_widget and window.winfo_exists():
-                 try:
-                     # Define the exact range of the thinking message
-                     # Index calculation can be tricky with variable width fonts/newlines
-                     # Let's try getting text from start index to current end and check
-                     chat_history_widget.config(state=tk.NORMAL)
-                     current_end_index = chat_history_widget.index(tk.END + "-1c")
-                     
-                     # Check if the "Thinking..." text is likely still at the end
-                     # Fetch the last line or so to verify
-                     check_range_start = f"{thinking_start_index} linestart"
-                     check_text = chat_history_widget.get(check_range_start, tk.END).strip()
+    # Prepare message history for Ollama API call (needs image bytes for *this* message)
+    history_for_ollama = []
+    image_bytes_for_request = None
+    try:
+        # Read image bytes if provided for this request
+        if image_path:
+            print(f"[Chat Worker] Reading image for request: {image_path}")
+            try:
+                with open(image_path, 'rb') as f:
+                    image_bytes_for_request = f.read()
+                print(f"[Chat Worker] Image bytes loaded ({len(image_bytes_for_request)} bytes).")
+            except Exception as e:
+                 err_text = f"Error reading image file '{os.path.basename(image_path)}': {e}"
+                 print(f"[Chat Worker] {err_text}")
+                 send_error_to_web(err_text)
+                 stream_in_progress = False # Reset flag
+                 ollama_lock.release() # Release lock on error
+                 return # Stop processing
 
-                     if thinking_text.strip() in check_text.splitlines()[-1]: # Check last line
-                          # More precise end calculation needed if possible
-                          end_thinking = f"{thinking_start_index}+{len(thinking_text)}c"
-                          # Verify the content exactly before deleting
-                          if chat_history_widget.get(thinking_start_index, end_thinking) == thinking_text:
-                               print("[UI] Removing 'Thinking...' indicator.")
-                               chat_history_widget.delete(thinking_start_index, end_thinking)
-                          else:
-                               print("[UI] 'Thinking...' text mismatch, not removing automatically.")
-                     else:
-                         # Response likely started, no need to delete "Thinking..."
-                         print("[UI] Response likely started, skipping 'Thinking...' removal.")
-                         pass
-                     
-                     chat_history_widget.config(state=tk.DISABLED)
-                 except tk.TclError as e:
-                     if "application has been destroyed" not in str(e):
-                         print(f"[UI] TclError removing 'Thinking...' (widget destroyed?): {e}")
-                 except Exception as e:
-                      print(f"[UI] Error removing 'Thinking...' indicator: {e}")
+        # Get history copy, prepare for Ollama format
+        with messages_lock:
+            history_copy = list(messages) # Get copy within lock
 
-            # --- Re-enable Send Button ---
-            if send_button: send_button.config(state=tk.NORMAL)
-            print("[UI] Send button re-enabled.")
-            # --- Ensure stream processing stops polling ---
-            # (process_stream_queue checks stream_in_progress, so setting it False here is enough)
+        # Construct messages list for API, potentially adding image bytes to last user message
+        is_last_message = True
+        for msg in reversed(history_copy): # Iterate backwards to easily find the last user message
+            msg_for_api = msg.copy()
+            # Remove internal placeholders or image data from history copy sent to API
+            if "images" in msg_for_api: del msg_for_api["images"] # Remove byte arrays from history copy
+            # If this is the last user message and we have image bytes, add them
+            if msg_for_api["role"] == "user" and is_last_message and image_bytes_for_request:
+                 msg_for_api["images"] = [image_bytes_for_request]
+                 # Remove the placeholder text added earlier if present
+                 # placeholder = f" [Image: {os.path.basename(image_path)}]"
+                 # if msg_for_api["content"].endswith(placeholder):
+                 #      msg_for_api["content"] = msg_for_api["content"][:-len(placeholder)].rstrip()
 
-        elif window and window.winfo_exists(): # Worker not done, reschedule check
-            window.after(150, check_done) # Check again
-        else: # Window closed, stop checking
-             print("[UI] Window closed, stopping worker completion check.")
+            history_for_ollama.insert(0, msg_for_api) # Insert at beginning to maintain order
+            if msg_for_api["role"] == "user": is_last_message = False # Only add image to the very last one
+
+    except Exception as hist_err:
+         err_text = f"Error preparing chat history for Ollama: {hist_err}"
+         print(f"[Chat Worker] {err_text}")
+         send_error_to_web(err_text)
+         stream_in_progress = False
+         ollama_lock.release()
+         return
+
+    # --- Call Ollama API ---
+    assistant_response = ""
+    try:
+        print(f"[Chat Worker] Sending request to model {current_model}...")
+        # print(f"[Chat Worker] History for API: {history_for_ollama}") # Debug: Careful with image bytes in log
+
+        stream = ollama.chat(model=current_model, messages=history_for_ollama, stream=True)
+
+        first_chunk = True
+        for chunk in stream:
+            if 'message' in chunk and 'content' in chunk['message']:
+                content_piece = chunk['message']['content']
+                if first_chunk:
+                     web_output_queue.put({"type": "stream_start"}) # Signal web UI
+                     first_chunk = False
+                web_output_queue.put({"type": "stream_chunk", "data": content_piece})
+                assistant_response += content_piece
+                queue_tts_text(content_piece) # Queue for TTS
+            if 'error' in chunk:
+                 err_text = f"Ollama stream error: {chunk['error']}"
+                 print(f"[Chat Worker] {err_text}")
+                 send_error_to_web(err_text)
+                 assistant_response = None # Mark as error
+                 break
+            if chunk.get('done', False): break
+
+        # --- After Streaming ---
+        if assistant_response is not None:
+             # Add complete assistant response to shared history
+             try:
+                 with messages_lock:
+                     messages.append({"role": "assistant", "content": assistant_response})
+                 # Send history update via SSE AFTER releasing lock
+                 web_output_queue.put({"type": "history_update", "data": get_current_chat_history()})
+                 print(f"[Chat Worker] Assistant response added to history.")
+             except Exception as lock_err:
+                 print(f"[Chat Worker] Error adding assistant response to history: {lock_err}")
+
+             web_output_queue.put({"type": "stream_end"}) # Signal web UI
+             queue_tts_text("\n") # Force TTS flush check
+             try_flush_tts_buffer()
+
+    except ollama.ResponseError as ore:
+         err_text = f"Ollama API Error: {ore.status_code} - {ore.error}"
+         print(f"[Chat Worker] {err_text}")
+         send_error_to_web(err_text)
+    except Exception as e:
+        err_text = f"Ollama communication error: {e}"
+        print(f"[Chat Worker] {err_text}")
+        traceback.print_exc()
+        send_error_to_web(err_text)
+    finally:
+        stream_in_progress = False
+        ollama_lock.release() # IMPORTANT: Release the lock
+        print("[Chat Worker] Worker finished.")
+        # Clean up the sent image file if it exists
+        if image_path and os.path.exists(image_path):
+             try:
+                  # Check if it's in the upload folder before deleting
+                  if UPLOAD_FOLDER in os.path.abspath(image_path):
+                       os.unlink(image_path)
+                       print(f"[Chat Worker] Cleaned up sent image: {os.path.basename(image_path)}")
+             except Exception as del_err:
+                  print(f"[Chat Worker] Error deleting sent image {image_path}: {del_err}")
+
+def fetch_available_models():
+    """Fetches available Ollama models."""
+    try:
+        models_data = ollama.list()
+        valid_models = []
+        
+        # Case 1: New format - models_data has a 'models' attribute that contains Model objects
+        if hasattr(models_data, 'models') and isinstance(models_data.models, list):
+            for model_obj in models_data.models:
+                if hasattr(model_obj, 'model'):
+                    valid_models.append(model_obj.model)
+                else:
+                    print(f"[Ollama] Warning: Model object missing 'model' attribute: {model_obj}")
+        
+        # Case 2: Old format - models_data is a dict with 'models' key containing dicts
+        elif isinstance(models_data, dict) and 'models' in models_data:
+            models_list = models_data.get('models', [])
+            if isinstance(models_list, list):
+                for model in models_list:
+                    if isinstance(model, dict) and 'name' in model:
+                        valid_models.append(model['name'])
+                    else:
+                        print(f"[Ollama] Warning: Skipping invalid model entry: {model}")
+        
+        # Log warning for unexpected format
+        else:
+            print(f"[Ollama] Warning: Unexpected format received from ollama.list(). Got: {models_data}")
+        
+        # Return valid models or fallback list if none found
+        return valid_models if valid_models else [DEFAULT_OLLAMA_MODEL, "llama3:8b", "phi3:mini"]
+    
+    except Exception as e:
+        print(f"[Ollama] Error fetching models: {e}")
+        # Provide common fallbacks if API fails
+        return [DEFAULT_OLLAMA_MODEL, "llama3:8b", "phi3:mini"]
+
+# ============================================================================
+# Flask Application Setup
+# ============================================================================
+
+def create_flask_app():
+    """Creates and configures the Flask application."""
+    app = Flask(__name__, template_folder='templates')
+    app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+    app.secret_key = os.urandom(24) # Needed for session/flash messages if used
+
+    # Create upload folder if it doesn't exist
+    if not os.path.exists(UPLOAD_FOLDER):
+        os.makedirs(UPLOAD_FOLDER)
+
+    # --- Basic Routes ---
+    @app.route('/')
+    def index():
+        """Serves the main HTML page."""
+        return render_template('index.html')
+
+    @app.route('/styles.css')
+    def styles():
+         # Route for external CSS if you create one
+         return send_from_directory('templates', 'styles.css')
 
 
-    # Start the first check for stream queue processing
-    if window and window.winfo_exists():
-         window.after(100, process_stream_queue)
-         # Start the first check for worker completion
-         window.after(150, check_done)
-    else:
-         print("[UI] Window closed, cannot start queue processing or completion checks.")
+    # --- API Routes ---
+    @app.route('/api/send_message', methods=['POST'])
+    def api_send_message():
+        """Handles message submission (text + optional file)."""
+        global selected_file_path, selected_file_type, file_processed_for_input
 
+        if stream_in_progress:
+            return jsonify({"status": "error", "message": "Please wait for the previous response."}), 429 # Too Many Requests
+
+        user_text = request.form.get('message', '').strip()
+        file = request.files.get('file')
+        file_content_for_input = None
+
+        # --- File Handling ---
+        if file and file.filename:
+            if allowed_file(file.filename):
+                filename = secure_filename(file.filename)
+                temp_save_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{int(time.time())}_{filename}")
+                try:
+                    file.save(temp_save_path)
+                    print(f"[API Send] File '{filename}' uploaded and saved to {temp_save_path}")
+                    # Process the saved file (determines type, extracts content if applicable)
+                    file_content_for_input = process_uploaded_file(temp_save_path)
+                    # If processing failed, selected_file_path/type will be None
+                    if selected_file_path is None:
+                        return jsonify({"status": "error", "message": f"Failed to process or unsupported file type: {filename}"}), 400
+
+                except Exception as e:
+                    print(f"[API Send] Error saving or processing upload '{filename}': {e}")
+                    return jsonify({"status": "error", "message": f"Error handling uploaded file: {e}"}), 500
+            else:
+                return jsonify({"status": "error", "message": f"File type not allowed: {file.filename}"}), 400
+        else:
+             # Clear any previous file selection if no new file is uploaded
+             # selected_file_path = None
+             # selected_file_type = None
+             # file_processed_for_input = False
+             pass # Keep existing selection if no new file provided? Depends on desired UX. Let's clear it.
+             if not request.form.get('keep_attachment'): # Add a flag from frontend if needed
+                 selected_file_path = None
+                 selected_file_type = None
+                 file_processed_for_input = False
+
+
+        # --- Message Content Preparation ---
+        final_user_text = user_text
+        # Option 1: Prepend extracted content automatically
+        # if file_content_for_input:
+        #     final_user_text = f"--- Content from {selected_file_type}: {os.path.basename(selected_file_path)} ---\n{file_content_for_input}\n\n---\n\n{user_text}"
+
+        # Option 2: Assume frontend handles placing content in the message box if desired.
+        # Backend just needs to know *if* a file (especially image) is attached.
+
+        if not final_user_text and not selected_file_path:
+             return jsonify({"status": "error", "message": "Please enter a message or attach a file."}), 400
+
+        # --- Start Chat ---
+        run_chat_interaction(final_user_text) # Handles Ollama call, history, TTS stop etc.
+
+        return jsonify({"status": "success", "message": "Message received, processing..."})
+
+    @app.route('/api/clear_attachment', methods=['POST'])
+    def api_clear_attachment():
+        global selected_file_path, selected_file_type, file_processed_for_input
+        cleared = False
+        if selected_file_path:
+            print(f"[API Clear] Clearing attachment: {selected_file_path}")
+            # Delete the temp file if it exists in uploads
+            if UPLOAD_FOLDER in os.path.abspath(selected_file_path) and os.path.exists(selected_file_path):
+                try:
+                    os.unlink(selected_file_path)
+                    print(f"[API Clear] Deleted file: {os.path.basename(selected_file_path)}")
+                except Exception as e:
+                    print(f"[API Clear] Error deleting file {selected_file_path}: {e}")
+            selected_file_path = None
+            selected_file_type = None
+            file_processed_for_input = False
+            cleared = True
+
+        if cleared:
+             send_status_to_web("Attachment cleared.")
+             return jsonify({"status": "success", "message": "Attachment cleared."})
+        else:
+             return jsonify({"status": "no_op", "message": "No attachment to clear."})
+
+
+    @app.route('/api/history')
+    def api_history():
+        """Returns current chat history."""
+        return jsonify({"history": get_current_chat_history()})
+
+    @app.route('/api/stream')
+    def api_stream():
+        """SSE endpoint for streaming updates."""
+        def event_stream():
+            keepalive_freq = 15 # seconds
+            last_event_time = time.time()
+            # Immediately send current status on connect
+            try:
+                yield f"event: full_status\ndata: {json.dumps(get_full_backend_status())}\n\n"
+                # Send initial history too? Maybe better via separate /api/history call from client.
+                # yield f"event: history_update\ndata: {json.dumps(get_current_chat_history())}\n\n"
+                last_event_time = time.time()
+            except Exception as init_e:
+                 print(f"[SSE Stream] Error sending initial status: {init_e}")
+
+            print("[SSE Stream] Client connected.")
+            while True:
+                try:
+                    data = web_output_queue.get(timeout=keepalive_freq)
+                    event_type = data.get("type", "message") # Default type if not specified
+                    event_data = json.dumps(data.get("data", data)) # Send data part or whole object
+
+                    # Map internal types to SSE event types
+                    if event_type == "stream_start": sse_event = "stream_start"
+                    elif event_type == "stream_chunk": sse_event = "stream_chunk"
+                    elif event_type == "stream_end": sse_event = "stream_end"
+                    elif event_type == "error": sse_event = "error"
+                    elif event_type == "status": sse_event = "status" # General status text
+                    elif event_type == "status_update": sse_event = "status_update" # Specific source status (like VAD)
+                    elif event_type == "history_update": sse_event = "history_update"
+                    elif event_type == "voices_update": sse_event = "voices_update"
+                    elif event_type == "transcription": sse_event = "transcription"
+                    else: sse_event = "message" # Fallback
+
+                    yield f"event: {sse_event}\ndata: {event_data}\n\n"
+                    web_output_queue.task_done()
+                    last_event_time = time.time()
+
+                except queue.Empty:
+                    # Send keepalive comment
+                    yield ": keepalive\n\n"
+                    last_event_time = time.time() # Reset timer after keepalive
+                except GeneratorExit:
+                    print("[SSE Stream] Client disconnected.")
+                    break
+                except Exception as e:
+                    print(f"[SSE Stream] Error in stream loop: {e}")
+                    try: # Try to inform client
+                         yield f"event: error\ndata: {json.dumps({'type': 'error', 'data': f'SSE internal error: {e}'})}\n\n"
+                    except Exception: pass
+                    time.sleep(1) # Avoid rapid error loops
+        return Response(event_stream(), mimetype="text/event-stream")
+
+    @app.route('/api/status')
+    def api_status():
+        """Returns the current full backend status."""
+        return jsonify(get_full_backend_status())
+
+    @app.route('/api/models')
+    def api_models():
+        """Returns available Ollama models."""
+        # Consider caching this if fetching is slow/expensive
+        models = fetch_available_models()
+        return jsonify({"models": models})
+    
+
+
+    @app.route('/api/voices')
+    def api_voices():
+         """Returns available TTS voices."""
+         voices = get_available_voices()
+         return jsonify({"voices": voices})
+
+
+    # --- Control Routes ---
+    @app.route('/api/control/model', methods=['POST'])
+    def api_control_model():
+        data = request.get_json()
+        model_name = data.get('model')
+        if not model_name:
+            return jsonify({"status": "error", "message": "Missing 'model' parameter."}), 400
+        # Add validation if needed (check against fetch_available_models?)
+        global current_model
+        current_model = model_name
+        print(f"[API Control] Ollama model set to: {current_model}")
+        send_status_to_web(f"Ollama model changed to: {current_model}")
+        return jsonify({"status": "success", "current_model": current_model})
+
+    @app.route('/api/control/tts', methods=['POST'])
+    def api_control_tts():
+        data = request.get_json()
+        enable = data.get('enable')
+        if enable is None:
+             return jsonify({"status": "error", "message": "Missing 'enable' parameter (true/false)."}), 400
+        success = toggle_tts(bool(enable))
+        return jsonify({"status": "success" if success else "error", "tts_enabled": tts_enabled_state})
+
+    @app.route('/api/control/tts_settings', methods=['POST'])
+    def api_control_tts_settings():
+         data = request.get_json()
+         rate = data.get('rate')
+         voice_id = data.get('voice_id')
+         results = {}
+         if rate is not None:
+             success_rate = set_tts_rate(rate)
+             results['rate_set'] = success_rate
+         if voice_id is not None:
+             success_voice = set_tts_voice(voice_id)
+             results['voice_set'] = success_voice
+
+         return jsonify({
+             "status": "success",
+             "results": results,
+             "current_rate": tts_rate_state,
+             "current_voice_id": tts_voice_id_state
+         })
+
+    @app.route('/api/control/vad', methods=['POST'])
+    def api_control_vad():
+        data = request.get_json()
+        enable = data.get('enable')
+        if enable is None:
+             return jsonify({"status": "error", "message": "Missing 'enable' parameter (true/false)."}), 400
+        success = toggle_voice_recognition(bool(enable))
+        # Give a slight delay for status update to potentially propagate via SSE
+        time.sleep(0.1)
+        return jsonify({"status": "success", "vad_enabled": voice_enabled_state, "current_status": get_vad_status()})
+
+    @app.route('/api/control/whisper_settings', methods=['POST'])
+    def api_control_whisper_settings():
+         data = request.get_json()
+         lang_code = data.get('language_code') # Expect code like 'en', 'fi', or null for auto
+         model_size = data.get('model_size')
+         results = {}
+         if lang_code is not None or data.get('language_code') == None: # Allow null for auto
+             success_lang = set_whisper_language(lang_code)
+             results['language_set'] = success_lang
+         if model_size is not None:
+             success_model = set_whisper_model(model_size)
+             results['model_set'] = success_model
+
+         return jsonify({
+             "status": "success",
+             "results": results,
+             "current_language": whisper_language_state,
+             "current_model": whisper_model_size
+         })
+
+    return app
+
+def get_full_backend_status():
+     """Helper to gather current state for the status API."""
+     return {
+         "ollama_model": current_model,
+         "tts_enabled": tts_enabled_state,
+         "tts_rate": tts_rate_state,
+         "tts_voice_id": tts_voice_id_state,
+         "tts_initialized": tts_initialized_successfully,
+         "vad_enabled": voice_enabled_state,
+         "vad_status": get_vad_status(),
+         "whisper_language": whisper_language_state,
+         "whisper_model": whisper_model_size,
+         "whisper_initialized": whisper_initialized,
+         "vad_initialized": vad_initialized,
+         "attachment": {
+             "filename": os.path.basename(selected_file_path) if selected_file_path else None,
+             "type": selected_file_type
+         }
+     }
 
 # ===================
-# Main Application Setup & Loop
+# Main Execution
 # ===================
-def on_closing():
-    """Handles application shutdown gracefully."""
-    print("[Main] Closing application...")
-    global window, flask_thread, vad_thread, whisper_processing_thread, tts_thread, py_audio
+def initialize_backend():
+    """Initializes components that need early setup."""
+    print("[Backend Init] Initializing components...")
+    initialize_audio_system()
+    initialize_tts() # Try to init TTS early to get voices
+    # VAD/Whisper init will be triggered by toggle_voice_recognition if enabled by default
 
-    # --- Signal background threads to stop ---
+    # Start periodic checks only once
+    threading.Timer(0.2, periodic_tts_check).start() # Start TTS flush check timer
 
-    # 1. Signal VAD thread
+    # Start default services if enabled
+    if tts_enabled_state:
+        start_tts_thread()
+    if voice_enabled_state:
+        toggle_voice_recognition(True) # Start VAD/Whisper init
+
+    print("[Backend Init] Initialization sequence complete.")
+
+
+def cleanup_on_exit():
+    """Gracefully shutdown background threads and resources."""
+    print("[Cleanup] Starting shutdown process...")
+
+    # 1. Signal VAD thread to stop
     if vad_thread and vad_thread.is_alive():
-        print("[Main] Stopping VAD thread...")
+        print("[Cleanup] Stopping VAD thread...")
         vad_stop_event.set()
-        # Don't join here yet, allow audio cleanup first
 
     # 2. Stop Whisper processing thread
     if whisper_processing_thread and whisper_processing_thread.is_alive():
-         print("[Main] Stopping Whisper processing thread...")
-         whisper_queue.put(None) # Send sentinel
-         # Don't join here yet
+         print("[Cleanup] Stopping Whisper processing thread...")
+         whisper_queue.put(None)
 
     # 3. Stop TTS thread
-    stop_tts_thread() # Handles engine stop and thread join internally
+    stop_tts_thread()
 
-    # --- Join worker threads (after signaling) ---
-    # Give them some time to finish cleanly
-    join_timeout = 2.0 # seconds
-
+    # --- Join threads ---
+    join_timeout = 2.0
     if vad_thread and vad_thread.is_alive():
-         print("[Main] Waiting for VAD thread to join...")
          vad_thread.join(timeout=join_timeout)
-         if vad_thread.is_alive(): print("[Main] Warning: VAD thread did not exit cleanly.")
-         else: print("[Main] VAD thread joined.")
-
+         if vad_thread.is_alive(): print("[Cleanup] Warning: VAD thread did not exit.")
+         else: print("[Cleanup] VAD thread joined.")
     if whisper_processing_thread and whisper_processing_thread.is_alive():
-         print("[Main] Waiting for Whisper thread to join...")
          whisper_processing_thread.join(timeout=join_timeout)
-         if whisper_processing_thread.is_alive(): print("[Main] Warning: Whisper thread did not exit cleanly.")
-         else: print("[Main] Whisper thread joined.")
+         if whisper_processing_thread.is_alive(): print("[Cleanup] Warning: Whisper thread did not exit.")
+         else: print("[Cleanup] Whisper thread joined.")
 
-    # --- Clean up resources ---
-
-    # 4. Terminate PyAudio (after VAD stream is closed)
+    # 4. Terminate PyAudio
     if py_audio:
-        print("[Main] Terminating PyAudio...")
-        try:
-             py_audio.terminate()
-             print("[Main] PyAudio terminated.")
-        except Exception as pa_term_err:
-             print(f"[Main] Error terminating PyAudio: {pa_term_err}")
+        print("[Cleanup] Terminating PyAudio...")
+        try: py_audio.terminate()
+        except Exception as pa_err: print(f"[Cleanup] PyAudio termination error: {pa_err}")
 
-    # 5. Clean up temporary audio file if it exists
-    global temp_audio_file_path
+    # 5. Clean up temporary files (VAD recording, uploads)
+    print("[Cleanup] Cleaning up temporary files...")
     if temp_audio_file_path and os.path.exists(temp_audio_file_path):
-        try:
-            print(f"[Main] Deleting temporary audio file: {temp_audio_file_path}")
-            os.unlink(temp_audio_file_path)
-        except Exception as e:
-            print(f"[Main] Error deleting temp file: {e}")
-
-    # 6. Shutdown Flask server (optional, daemon thread should exit anyway)
-    # Forcing shutdown might require more complex signaling or accessing the Werkzeug server instance
-    print("[Main] Flask thread is daemon, should exit automatically.")
-    # If flask_thread needs explicit cleanup, it would be done here.
-
-    # 7. Destroy the Tkinter window
-    if window:
-        print("[Main] Destroying Tkinter window...")
-        try:
-            window.destroy()
-            print("[Main] Window destroyed.")
-        except tk.TclError as e:
-            print(f"[Main] Error destroying window (might already be closed): {e}")
-        except Exception as e:
-             print(f"[Main] Unexpected error destroying window: {e}")
-
-    print("[Main] Application closed.")
-    # Force exit if threads are stuck (use cautiously)
-    # sys.exit(0)
-
-
-# --- Build GUI ---
-# Use TkinterDnD.Tk for the main window to enable drag & drop
-try:
-    window = TkinterDnD.Tk()
-    print("[UI] TkinterDnD initialized.")
-except Exception as dnd_err:
-     print(f"[UI] Error initializing TkinterDnD: {dnd_err}")
-     print("[UI] Falling back to standard Tkinter. Drag and Drop will be disabled.")
-     window = tk.Tk() # Fallback
-
-window.title(APP_TITLE)
-window.geometry(WINDOW_GEOMETRY)
-
-# --- Tkinter Variables ---
-tts_enabled = tk.BooleanVar(value=True)
-tts_rate = tk.IntVar(value=160) # Default TTS rate
-tts_voice_id = tk.StringVar(value="") # Default voice (will be set later)
-voice_enabled = tk.BooleanVar(value=True) # Default VAD/Whisper state
-auto_send_after_transcription = tk.BooleanVar(value=True) # Default auto-send state
-selected_whisper_language = tk.StringVar() # Bound to language dropdown
-selected_whisper_model = tk.StringVar(value=whisper_model_size) # Bound to model size dropdown
-
-# --- Main Frame ---
-main_frame = tk.Frame(window, padx=10, pady=10)
-main_frame.pack(fill=tk.BOTH, expand=True)
-
-# --- Top Controls Frame ---
-top_controls_frame = tk.Frame(main_frame)
-top_controls_frame.pack(fill=tk.X, expand=False, pady=(0, 10))
-top_controls_frame.columnconfigure(0, weight=3) # Model selection wider
-top_controls_frame.columnconfigure(1, weight=2) # TTS controls
-top_controls_frame.columnconfigure(2, weight=2) # Voice controls
-
-# --- Model Selection ---
-model_frame = tk.LabelFrame(top_controls_frame, text="Ollama Model", padx=5, pady=5)
-model_frame.grid(row=0, column=0, sticky="ew", padx=(0, 5))
-
-print("[UI] Fetching available Ollama models...")
-available_models = fetch_available_models()
-model_selector = ttk.Combobox(model_frame, values=available_models, state="readonly", width=25)
-
-# Set initial model selection
-current_model_set = False
-if available_models:
-    # Prioritize DEFAULT_OLLAMA_MODEL if available
-    if DEFAULT_OLLAMA_MODEL in available_models:
-        model_selector.set(DEFAULT_OLLAMA_MODEL)
-        current_model = DEFAULT_OLLAMA_MODEL
-        current_model_set = True
-    # Otherwise, try the first model in the list
-    elif available_models:
-        model_selector.set(available_models[0])
-        current_model = available_models[0]
-        current_model_set = True
-
-if not current_model_set:
-    model_selector.set("No models found")
-    model_selector.config(state=tk.DISABLED)
-    current_model = None # Ensure current_model reflects lack of selection
-    print("[UI] No Ollama models found or fetch failed.")
-
-model_selector.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,5))
-model_selector.bind("<<ComboboxSelected>>", select_model)
-
-model_status = tk.Label(model_frame, text=f"Using: {current_model.split(':')[0] if current_model else 'N/A'}", font=("Arial", 8), width=15, anchor="w")
-model_status.pack(side=tk.LEFT)
-
-# --- TTS Controls ---
-tts_outer_frame = tk.LabelFrame(top_controls_frame, text="Text-to-Speech", padx=5, pady=5)
-tts_outer_frame.grid(row=0, column=1, sticky="nsew", padx=5) # Use sticky nsew
-
-tts_toggle_button = ttk.Checkbutton(tts_outer_frame, text="Enable TTS", variable=tts_enabled, command=toggle_tts)
-tts_toggle_button.pack(anchor="w", pady=2)
-
-# Voice Selector
-voice_frame = tk.Frame(tts_outer_frame)
-voice_frame.pack(fill=tk.X, pady=2)
-tk.Label(voice_frame, text="Voice:", font=("Arial", 8)).pack(side=tk.LEFT)
-print("[UI] Getting available TTS voices...")
-available_voices = get_available_voices() # Populated by get_available_voices()
-voice_names = [v[0] for v in available_voices] if available_voices else ["No voices found"]
-voice_selector = ttk.Combobox(voice_frame, values=voice_names, state="disabled", width=18, font=("Arial", 8), textvariable=tts_voice_id) # Bind to variable
-
-if available_voices:
-    # Try to find a reasonable default voice
-    default_voice_index = 0
-    preferred_voices = ["Zira", "David", "Hazel", "Susan", "Microsoft ", "Google UK"] # Example preferences
-    for i, (name, v_id) in enumerate(available_voices):
-         if any(pref in name for pref in preferred_voices):
-             default_voice_index = i
-             break
-    voice_selector.current(default_voice_index)
-    tts_voice_id.set(available_voices[default_voice_index][1]) # Set initial voice ID variable
-    voice_selector.bind("<<ComboboxSelected>>", set_voice)
-    print(f"[UI] Default TTS voice set to: {available_voices[default_voice_index][0]}")
-else:
-    voice_selector.set("No voices found")
-    print("[UI] No TTS voices found.")
-
-voice_selector.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-
-
-# Rate Control
-rate_frame = tk.Frame(tts_outer_frame)
-rate_frame.pack(fill=tk.X, pady=2)
-tk.Label(rate_frame, text="Speed:", font=("Arial", 8)).pack(side=tk.LEFT)
-rate_scale = ttk.Scale(rate_frame, from_=80, to=300, orient=tk.HORIZONTAL, variable=tts_rate, command=set_speech_rate, length=80, state="disabled") # Start disabled
-rate_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-rate_value = tk.Label(rate_frame, textvariable=tts_rate, width=3, font=("Arial", 8))
-rate_value.pack(side=tk.LEFT)
-
-
-# --- Voice Recognition Controls ---
-voice_outer_frame = tk.LabelFrame(top_controls_frame, text="Voice Input (VAD)", padx=5, pady=5)
-voice_outer_frame.grid(row=0, column=2, sticky="nsew", padx=(5, 0)) # Use sticky nsew
-
-voice_toggle_button = ttk.Checkbutton(voice_outer_frame, text="Enable Voice", variable=voice_enabled, command=toggle_voice_recognition)
-voice_toggle_button.pack(anchor="w", pady=2)
-
-# Whisper Settings Frame
-whisper_settings_frame = tk.Frame(voice_outer_frame)
-whisper_settings_frame.pack(fill=tk.X, pady=2)
-
-# Language Selector
-lang_frame = tk.Frame(whisper_settings_frame)
-lang_frame.pack(fill=tk.X)
-tk.Label(lang_frame, text="Lang:", font=("Arial", 8)).pack(side=tk.LEFT)
-whisper_language_selector = ttk.Combobox(lang_frame, values=[lang[0] for lang in WHISPER_LANGUAGES],
-                                         state="readonly", width=10, font=("Arial", 8),
-                                         textvariable=selected_whisper_language)
-whisper_language_selector.current(0) # Default to "Auto Detect" (index 0)
-set_whisper_language() # Initialize whisper_language variable from initial selection
-whisper_language_selector.pack(side=tk.LEFT, padx=2)
-whisper_language_selector.bind("<<ComboboxSelected>>", set_whisper_language)
-
-
-# Model Size Selector
-size_frame = tk.Frame(whisper_settings_frame)
-size_frame.pack(fill=tk.X, pady=(2,0))
-tk.Label(size_frame, text="Model:", font=("Arial", 8)).pack(side=tk.LEFT)
-whisper_model_size_selector = ttk.Combobox(size_frame, values=WHISPER_MODEL_SIZES,
-                                           state="readonly", width=10, font=("Arial", 8),
-                                           textvariable=selected_whisper_model)
-# selected_whisper_model already set to default, selector will reflect it
-whisper_model_size_selector.pack(side=tk.LEFT, padx=2)
-whisper_model_size_selector.bind("<<ComboboxSelected>>", set_whisper_model_size)
-
-
-# Auto-send checkbox (Corrected)
-auto_send_checkbox = ttk.Checkbutton(voice_outer_frame, text="Auto-send",
-                                     variable=auto_send_after_transcription)
-                                     # tooltip="Automatically send message after voice transcription") # Removed this line
-auto_send_checkbox.pack(anchor="w", pady=2)
-
-
-# Recording Status Indicator
-recording_indicator_widget = tk.Label(voice_outer_frame, text="Voice Disabled", font=("Arial", 9, "italic"), fg="grey", anchor="w")
-recording_indicator_widget.pack(fill=tk.X, pady=(5,2), padx=2)
-
-
-# --- Chat History ---
-chat_frame = tk.LabelFrame(main_frame, text="Chat History", padx=5, pady=5)
-chat_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-
-chat_history_widget = scrolledtext.ScrolledText(chat_frame, wrap=tk.WORD, height=15, state=tk.DISABLED, font=("Arial", 10))
-chat_history_widget.pack(fill=tk.BOTH, expand=True)
-
-# Define text tags
-chat_history_widget.tag_config("user_tag", foreground="#007bff", font=("Arial", 10, "bold"))
-chat_history_widget.tag_config("user_message", foreground="black", font=("Arial", 10))
-chat_history_widget.tag_config("bot_tag", foreground="#28a745", font=("Arial", 10, "bold"))
-chat_history_widget.tag_config("bot_message", foreground="black", font=("Arial", 10))
-chat_history_widget.tag_config("thinking", foreground="gray", font=("Arial", 10, "italic"))
-chat_history_widget.tag_config("error", foreground="#dc3545", font=("Arial", 10, "bold")) # Red
-chat_history_widget.tag_config("status", foreground="#6f42c1", font=("Arial", 9, "italic")) # Purple
-
-
-# --- Bottom Frame (Image + Input) ---
-bottom_frame = tk.Frame(main_frame)
-bottom_frame.pack(fill=tk.X, expand=False)
-
-# Image Frame (Left)
-image_frame = tk.LabelFrame(bottom_frame, text="Attachments", padx=5, pady=5)
-image_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
-
-image_preview = tk.Label(image_frame, text="No Image\nDrop Here", width=20, height=8,
-                        bg="lightgrey", relief="sunken", anchor="center")
-image_preview.pack(pady=5)
-
-# Register image preview as a drop target if TkinterDnD is available
-if isinstance(window, TkinterDnD.Tk):
-     print("[UI] Registering image preview as drop target.")
-     image_preview.drop_target_register(DND_FILES)
-     image_preview.dnd_bind('<<Drop>>', handle_file_drop) # Use generic handler
-else:
-     print("[UI] TkinterDnD not available, image drop disabled.")
-
-
-img_button_frame = tk.Frame(image_frame)
-img_button_frame.pack(fill=tk.X, pady=2)
-select_file_button = ttk.Button(img_button_frame, text="Open File", command=select_file, width=10)
-select_file_button.pack(side=tk.LEFT, expand=True, padx=2)
-clear_button = ttk.Button(img_button_frame, text="Clear Img", command=clear_image, width=10)
-clear_button.pack(side=tk.LEFT, expand=True, padx=2)
-
-image_indicator = tk.Label(image_frame, text="No image attached", font=("Arial", 8, "italic"), fg="grey")
-image_indicator.pack(pady=(3,0))
-
-
-# Input Frame (Right)
-input_frame = tk.LabelFrame(bottom_frame, text="Your Message (Enter=Send, Shift+Enter=Newline, Drag Files)", padx=10, pady=5)
-input_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-user_input_widget = scrolledtext.ScrolledText(input_frame, wrap=tk.WORD, height=4, font=("Arial", 10))
-user_input_widget.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
-user_input_widget.focus_set()
-
-# Register text input as a drop target if TkinterDnD is available
-if isinstance(window, TkinterDnD.Tk):
-     print("[UI] Registering text input as drop target.")
-     user_input_widget.drop_target_register(DND_FILES)
-     user_input_widget.dnd_bind('<<Drop>>', handle_file_drop) # Use generic handler
-else:
-     print("[UI] TkinterDnD not available, text input drop disabled.")
-
-
-send_button = ttk.Button(input_frame, text="Send", command=send_message, width=10)
-send_button.pack(pady=5, anchor='e') # Anchor to the right
-
-# --- Enter Key Binding ---
-def on_enter_press(event):
-    """Handles Enter key press in the input widget."""
-    # Check if Shift key is pressed (modifier state 1)
-    if event.state & 0x0001:
-        # Shift+Enter: Allow default behavior (insert newline)
-        return
-    else:
-        # Enter only: Trigger send message
-        send_message()
-        # Prevent default behavior (which would insert newline)
-        return "break"
-
-user_input_widget.bind("<KeyPress-Return>", on_enter_press)
-
-
-# --- Final Setup and Initialization ---
-window.protocol("WM_DELETE_WINDOW", on_closing) # Set close handler
-
-# Attempt to initialize TTS early but don't block startup
-# Let toggle_tts handle enabling controls based on success
-print("[Main] Pre-initializing TTS...")
-try:
-     if initialize_tts():
-         # Enable controls immediately if successful
-         if voice_selector: voice_selector.config(state="readonly")
-         if rate_scale: rate_scale.config(state="normal")
-         print("[Main] TTS pre-initialization successful.")
-     else:
-         # Add startup message about TTS failure
-         def show_tts_init_error():
-             add_message_to_ui("status", "Note: TTS engine failed to initialize. TTS controls disabled.")
-         if window and window.winfo_exists(): window.after(500, show_tts_init_error) # Delay slightly
-         print("[Main] TTS pre-initialization failed.")
-except Exception as init_e:
-     print(f"[Main] Error during TTS pre-initialization: {init_e}")
-
-
-# --- Start Background Threads and Checks ---
-
-# 1. Start the Flask server in a daemon thread (Phase 1)
-flask_thread = threading.Thread(target=run_flask, daemon=True)
-flask_thread.start()
-
-# 2. Schedule initial state toggles after GUI is loaded
-#    These will handle further initialization of TTS/VAD/Whisper if enabled by default.
-if window and window.winfo_exists():
-    window.after(1000, toggle_tts)  # Call after GUI is fully loaded
-    window.after(1500, toggle_voice_recognition)  # Call with slight delay
-
-# 3. Start periodic checks (TTS flush, Web Input)
-if window and window.winfo_exists():
-     window.after(200, periodic_tts_check)
-     window.after(300, check_web_input_queue) # (Phase 2) Start checking web input
-
-# 4. Set up paste binding (needs window and input widget to exist)
-if window and window.winfo_exists():
-    window.after(50, setup_paste_binding) # Short delay to ensure widgets are ready
-
-# --- Add Welcome Message ---
-def add_welcome():
-     add_message_to_ui("status", f"Welcome! Model: {current_model or 'N/A'}. Web UI on http://<YOUR_IP>:{FLASK_PORT}")
-if window and window.winfo_exists():
-     window.after(100, add_welcome)
-
-# --- Start Tkinter Main Loop ---
-print("[Main] Starting Tkinter main loop...")
-try:
-    window.mainloop()
-except KeyboardInterrupt:
-     print("[Main] KeyboardInterrupt received. Closing...")
-     on_closing()
+        try: os.unlink(temp_audio_file_path)
+        except Exception as e: print(f"[Cleanup] Error deleting temp VAD file: {e}")
+
+    if os.path.exists(UPLOAD_FOLDER):
+         for filename in os.listdir(UPLOAD_FOLDER):
+             file_path = os.path.join(UPLOAD_FOLDER, filename)
+             try:
+                 if os.path.isfile(file_path):
+                     os.unlink(file_path)
+             except Exception as e:
+                 print(f"[Cleanup] Error deleting upload {filename}: {e}")
+    # Optionally remove the upload folder itself
+    # try: os.rmdir(UPLOAD_FOLDER)
+    # except OSError as e: print(f"[Cleanup] Error removing upload folder: {e}")
+
+
+    print("[Cleanup] Shutdown complete.")
+
+
+if __name__ == '__main__':
+    # Ensure upload folder exists
+    if not os.path.exists(UPLOAD_FOLDER):
+        os.makedirs(UPLOAD_FOLDER)
+
+    # Initialize backend components in a separate thread to allow Flask to start sooner?
+    # Or do it sequentially before starting Flask. Sequential is simpler.
+    initialize_backend()
+
+    # Create and run Flask app
+    flask_app = create_flask_app() # Assign to global variable
+
+    print(f"\n[Flask] Starting server on http://{FLASK_HOST}:{FLASK_PORT}")
+    print(f"[Flask] Access UI from this machine: http://127.0.0.1:{FLASK_PORT}")
+    print(f"[Flask] Access UI from local network: http://<YOUR_LOCAL_IP>:{FLASK_PORT}")
+    print("[Flask] Press Ctrl+C to quit.")
+
+    # Register cleanup function
+    import atexit
+    atexit.register(cleanup_on_exit)
+
+    # Run Flask server
+    # debug=True causes issues with threading and restarts, keep False for this setup
+    flask_app.run(host=FLASK_HOST, port=FLASK_PORT, threaded=True, debug=False)
+
+    # Cleanup might not always run reliably on forced exit, atexit helps.
