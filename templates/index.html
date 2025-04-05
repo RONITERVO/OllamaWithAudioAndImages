@@ -6,6 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Ollama Web Chat++</title>
     <style>
+        /* --- Basic Styling (similar to provided example) --- */
         :root {
             --bg-color: #f8f9fa;
             --chat-bg: #ffffff;
@@ -17,26 +18,25 @@
             --status-text: #6c757d;
             --error-bg: #f8d7da;
             --error-text: #721c24;
+            --transcription-bg: #f0e6ff;
+            --transcription-text: #4a00e0;
             --border-color: #dee2e6;
             --control-bg: #f1f3f5;
             --button-bg: #007bff;
             --button-hover-bg: #0056b3;
             --button-disabled-bg: #ced4da;
             --link-color: #007bff;
-            --vad-listening: #6c757d;
-            /* gray */
-            --vad-recording: #dc3545;
-            /* red */
-            --vad-processing: #007bff;
-            /* blue */
-            --vad-ready: #28a745;
-            /* green */
-            --vad-error: #dc3545;
-            /* red */
-            --vad-paused: #ffc107;
-            /* yellow */
-            --vad-disabled: #6c757d;
-            /* gray */
+            /* VAD Status Colors */
+            --vad-grey: #6c757d;
+            /* disabled, listening */
+            --vad-red: #dc3545;
+            /* recording, error */
+            --vad-blue: #007bff;
+            /* processing, initializing, paused */
+            --vad-green: #28a745;
+            /* ready */
+            --vad-orange: #fd7e14;
+            /* transcribe error, short */
         }
 
         body {
@@ -49,6 +49,8 @@
             background-color: var(--bg-color);
             color: var(--bot-msg-text);
             font-size: 15px;
+            overflow: hidden;
+            /* Prevent body scroll */
         }
 
         .container {
@@ -56,50 +58,135 @@
             flex-direction: column;
             height: 100%;
             max-width: 1000px;
+            /* Max width */
+            width: 100%;
+            /* Take full width up to max */
             margin: 0 auto;
+            /* Center */
             border-left: 1px solid var(--border-color);
             border-right: 1px solid var(--border-color);
             background-color: var(--chat-bg);
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
         }
 
+        /* --- Controls Area --- */
         #controls-area {
-            padding: 10px 15px;
+            padding: 8px 15px;
             border-bottom: 1px solid var(--border-color);
             background-color: var(--control-bg);
             display: flex;
             flex-wrap: wrap;
-            gap: 15px;
+            /* Allow wrapping on smaller screens */
+            gap: 10px 20px;
+            /* Row gap, Column gap */
             align-items: center;
-            font-size: 0.9em;
+            font-size: 0.85em;
+            /* Slightly smaller controls */
         }
 
         .control-group {
             display: flex;
-            flex-direction: column;
+            align-items: center;
+            /* Align label and control */
+            gap: 8px;
+        }
+
+        .control-group>div {
+            /* Container for multiple controls in a group */
+            display: flex;
+            align-items: center;
             gap: 5px;
         }
 
         .control-group label {
             font-weight: 500;
-            margin-bottom: 2px;
+            white-space: nowrap;
+            /* Prevent label wrapping */
             color: #495057;
         }
 
         .control-group select,
-        .control-group input {
+        .control-group input[type="range"] {
             padding: 4px 6px;
             border: 1px solid var(--border-color);
             border-radius: 4px;
             font-size: 0.95em;
+            max-width: 150px;
+            /* Limit width of dropdowns */
         }
 
-        .control-group button {
-            padding: 4px 8px;
+        .control-group input[type="checkbox"] {
+            margin-left: 2px;
+            /* Align checkbox better */
         }
 
+        .control-group input[type="range"] {
+            max-width: 80px;
+            /* Smaller range slider */
+            height: 5px;
+            cursor: pointer;
+        }
+
+        #tts-rate-value {
+            min-width: 25px;
+            /* Ensure space for 3 digits */
+            text-align: right;
+            font-family: monospace;
+        }
+
+        #vad-status-display {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            min-width: 120px;
+            /* Prevent jumpiness */
+            padding: 2px 5px;
+            border: 1px solid transparent;
+            /* Reserve space */
+            border-radius: 4px;
+        }
+
+        #vad-status-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background-color: var(--vad-grey);
+            display: inline-block;
+            flex-shrink: 0;
+            /* Prevent shrinking */
+            transition: background-color 0.3s ease;
+        }
+
+        #vad-status-text {
+            font-size: 0.9em;
+            color: var(--status-text);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        #vad-status-display.status-red {
+            border-color: var(--vad-red);
+        }
+
+        #vad-status-display.status-orange {
+            border-color: var(--vad-orange);
+        }
+
+        #vad-status-display.status-blue {
+            border-color: var(--vad-blue);
+        }
+
+        #vad-status-display.status-green {
+            border-color: var(--vad-green);
+        }
+
+
+        /* --- Chat Area --- */
         #chatbox-container {
             flex-grow: 1;
             overflow-y: auto;
+            /* Enable scrolling */
             padding: 15px;
             display: flex;
             flex-direction: column;
@@ -107,40 +194,49 @@
 
         #chatbox {
             width: 100%;
-            margin: 0 auto;
             flex-grow: 1;
+            /* Allow chatbox to take space */
         }
 
         .message {
-            margin-bottom: 10px;
-            padding: 8px 12px;
-            border-radius: 12px;
+            margin-bottom: 12px;
+            padding: 10px 14px;
+            border-radius: 18px;
             max-width: 85%;
+            /* Limit message width */
             word-wrap: break-word;
+            /* Allow long words to break */
             line-height: 1.5;
             position: relative;
-            /* For potential future features like copy buttons */
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
         }
 
         .user {
             background-color: var(--user-msg-bg);
             color: var(--user-msg-text);
             margin-left: auto;
-            border-bottom-right-radius: 2px;
+            /* Align right */
+            border-bottom-right-radius: 4px;
+            /* Slight flattening */
         }
 
         .assistant {
             background-color: var(--bot-msg-bg);
             color: var(--bot-msg-text);
             margin-right: auto;
-            border-bottom-left-radius: 2px;
+            /* Align left */
+            border-bottom-left-radius: 4px;
+            /* Slight flattening */
         }
 
+        /* Streaming indicator */
         .assistant.streaming::after {
             content: '▍';
-            /* Blinking cursor */
             animation: blink 1s step-end infinite;
-            margin-left: 3px;
+            margin-left: 4px;
+            font-weight: bold;
+            color: var(--bot-msg-text);
+            opacity: 0.7;
         }
 
         @keyframes blink {
@@ -155,7 +251,7 @@
             font-weight: bold;
             text-align: center;
             margin: 5px auto;
-            max-width: 90%;
+            max-width: 95%;
             border: 1px solid #f5c6cb;
         }
 
@@ -164,22 +260,39 @@
             text-align: center;
             font-size: 0.85em;
             margin: 5px auto;
-            max-width: 90%;
+            max-width: 95%;
         }
 
         .transcription {
-            color: #4a00e0;
-            /* Purple */
+            background-color: var(--transcription-bg);
+            color: var(--transcription-text);
             font-style: italic;
             text-align: center;
             font-size: 0.9em;
             margin: 5px auto;
-            max-width: 90%;
+            max-width: 95%;
             padding: 5px 10px;
-            background-color: #f0e6ff;
             border-radius: 8px;
         }
 
+        .message pre {
+            /* Style code blocks if markdown is rendered */
+            background-color: #e9ecef;
+            padding: 10px;
+            border-radius: 5px;
+            overflow-x: auto;
+            font-family: monospace;
+            font-size: 0.9em;
+        }
+
+        .message code {
+            font-family: monospace;
+        }
+
+        /* Inline code */
+
+
+        /* --- Input Area --- */
         #input-area {
             display: flex;
             padding: 10px 15px;
@@ -187,51 +300,112 @@
             border-top: 1px solid var(--border-color);
             align-items: flex-end;
             /* Align items to bottom */
+            gap: 8px;
         }
 
-        textarea {
-            flex-grow: 1;
-            margin-right: 8px;
-            padding: 8px 10px;
+        #attachment-area {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        #file-input-label {
+            padding: 7px 10px;
+            /* Match button padding */
             border: 1px solid var(--border-color);
             border-radius: 6px;
+            cursor: pointer;
+            font-size: 1.1em;
+            /* Slightly larger icon */
+            background-color: #f8f9fa;
+            transition: background-color 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 34px;
+            /* Match button height */
+            box-sizing: border-box;
+        }
+
+        #file-input-label:hover {
+            background-color: #e9ecef;
+        }
+
+        #file-input {
+            display: none;
+        }
+
+        /* Hide actual file input */
+
+        #attachment-info {
+            font-size: 0.8em;
+            color: var(--status-text);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 120px;
+            /* Limit width */
+            display: inline-block;
+            line-height: 1.2;
+            vertical-align: middle;
+        }
+
+        #clear-attachment-btn {
+            padding: 3px 6px;
+            font-size: 0.8em;
+            background-color: var(--error-text);
+            display: none;
+            /* Hidden by default */
+            vertical-align: middle;
+            height: 22px;
+            line-height: 1;
+        }
+
+        #messageInput {
+            flex-grow: 1;
+            padding: 8px 10px;
+            border: 1px solid var(--border-color);
+            border-radius: 15px;
+            /* Pill shape */
             resize: none;
             font-family: inherit;
             font-size: 1em;
-            line-height: 1.5;
-            min-height: 30px;
-            /* Min height for ~1 line */
+            line-height: 1.4;
+            min-height: 18px;
+            /* Start small */
             max-height: 150px;
             /* Limit expansion */
             overflow-y: auto;
             /* Add scrollbar if needed */
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
         }
 
-        textarea:focus {
+        #messageInput:focus {
             outline: none;
             border-color: var(--button-bg);
-            box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.25);
+            box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.2);
         }
 
         #input-buttons {
             display: flex;
             gap: 5px;
             align-items: flex-end;
-            /* Align with textarea bottom */
-            margin-bottom: 3px;
-            /* Align with textarea padding */
         }
 
         button {
-            padding: 8px 12px;
+            padding: 8px 14px;
             background-color: var(--button-bg);
             color: white;
             border: none;
-            border-radius: 6px;
+            border-radius: 15px;
+            /* Pill shape */
             cursor: pointer;
             font-size: 0.95em;
             transition: background-color 0.2s ease;
             white-space: nowrap;
+            height: 34px;
+            /* Match input height */
+            box-sizing: border-box;
         }
 
         button:hover:not(:disabled) {
@@ -243,101 +417,73 @@
             cursor: not-allowed;
         }
 
-        button.secondary {
-            background-color: #6c757d;
+        #sendButton {
+            font-weight: 500;
         }
 
-        button.secondary:hover:not(:disabled) {
-            background-color: #5a6268;
-        }
-
-
-        #file-input-label {
-            padding: 8px 10px;
-            /* Match button padding */
-            border: 1px solid var(--border-color);
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 0.95em;
-            background-color: #f8f9fa;
-            transition: background-color 0.2s ease;
-        }
-
-        #file-input-label:hover {
-            background-color: #e9ecef;
-        }
-
-        #file-input {
-            display: none;
-            /* Hide actual file input */
-        }
-
-        #attachment-info {
-            font-size: 0.8em;
-            margin-top: 5px;
-            margin-left: 5px;
-            color: var(--status-text);
-            display: inline-block;
-            /* Keep next to button */
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            max-width: 150px;
-            /* Limit width */
-            vertical-align: bottom;
-        }
-
-        #clear-attachment-btn {
-            padding: 2px 5px;
-            font-size: 0.8em;
-            margin-left: 5px;
-            background-color: var(--error-text);
-            display: none;
-            /* Hidden by default */
-            vertical-align: bottom;
-        }
-
-        #vad-status-indicator {
-            width: 12px;
-            height: 12px;
+        /* Spinner for loading state */
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid var(--button-bg);
             border-radius: 50%;
-            background-color: var(--vad-disabled);
-            display: inline-block;
-            margin-right: 5px;
-            vertical-align: middle;
-            transition: background-color 0.3s ease;
+            width: 16px;
+            height: 16px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
         }
 
-        #vad-status-text {
-            font-size: 0.9em;
-            color: var(--status-text);
-            vertical-align: middle;
+        @keyframes spin {
+            0% {
+                transform: rotate(0deg);
+            }
+
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+
+        #chatbox-container.loading #chatbox::before {
+            content: "";
+            display: block;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 30px;
+            height: 30px;
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid var(--button-bg);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
         }
     </style>
 </head>
 
 <body>
     <div class="container">
+        <!-- Controls Area -->
         <div id="controls-area">
             <div class="control-group">
-                <label for="model-select">Ollama Model:</label>
-                <select id="model-select" title="Select Ollama model"></select>
+                <label for="model-select" title="Select Ollama model">Model:</label>
+                <select id="model-select"></select>
             </div>
             <div class="control-group">
-                <label>TTS:</label>
+                <label title="Enable/Disable Text-to-Speech">TTS:</label>
                 <div>
-                    <input type="checkbox" id="tts-enable" title="Enable/Disable Text-to-Speech">
+                    <input type="checkbox" id="tts-enable">
                     <select id="tts-voice-select" title="Select TTS voice"></select>
-                    <input type="range" id="tts-rate-slider" min="80" max="300" step="10" title="Adjust TTS speed">
+                    <input type="range" id="tts-rate-slider" min="80" max="350" step="10" title="Adjust TTS speed">
                     <span id="tts-rate-value">160</span>
                 </div>
             </div>
             <div class="control-group">
-                <label>Voice Input:</label>
+                <label title="Enable/Disable Voice Input (VAD/Whisper)">Voice:</label>
                 <div>
-                    <input type="checkbox" id="vad-enable" title="Enable/Disable Voice Input (VAD/Whisper)">
-                    <span id="vad-status-indicator" title="Voice input status"></span>
-                    <span id="vad-status-text">Disabled</span>
+                    <input type="checkbox" id="vad-enable">
+                    <div id="vad-status-display" title="Voice input status">
+                        <span id="vad-status-indicator"></span>
+                        <span id="vad-status-text">Disabled</span>
+                    </div>
                 </div>
             </div>
             <div class="control-group">
@@ -349,30 +495,36 @@
             </div>
         </div>
 
+        <!-- Chatbox Area -->
         <div id="chatbox-container">
             <div id="chatbox">
-                <!-- Messages appear here -->
+                <div class="status">Connecting to backend...</div>
             </div>
         </div>
 
+        <!-- Input Area -->
         <div id="input-area">
-            <!-- File input button -->
-            <input type="file" id="file-input"
-                accept=".png,.jpg,.jpeg,.gif,.bmp,.pdf,.txt,.md,.py,.js,.html,.css,.json,.log,.csv,.xml,.yaml,.ini,.sh,.bat">
-            <label for="file-input" id="file-input-label" title="Attach File">📎</label>
-            <span id="attachment-info"></span>
-            <button id="clear-attachment-btn" title="Clear Attachment" class="secondary">X</button>
-
-            <textarea id="messageInput" rows="1" placeholder="Enter your message..."></textarea>
-
+            <div id="attachment-area">
+                <input type="file" id="file-input"
+                    accept=".png,.jpg,.jpeg,.gif,.bmp,.pdf,.txt,.md,.py,.js,.html,.css,.json,.log,.csv,.xml,.yaml,.ini,.sh,.bat">
+                <label for="file-input" id="file-input-label" title="Attach File">📎</label>
+                <span id="attachment-info"></span>
+                <button id="clear-attachment-btn" title="Clear Attachment" class="secondary">X</button>
+            </div>
+            <textarea id="messageInput" rows="1"
+                placeholder="Enter your message... (Shift+Enter for newline)"></textarea>
             <div id="input-buttons">
                 <button id="sendButton" title="Send Message (Enter)">Send</button>
             </div>
         </div>
     </div>
 
+    <!-- Basic Markdown rendering library (optional, replace or remove if not needed) -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
     <script>
         // --- DOM Elements ---
+        const chatboxContainer = document.getElementById('chatbox-container');
         const chatbox = document.getElementById('chatbox');
         const messageInput = document.getElementById('messageInput');
         const sendButton = document.getElementById('sendButton');
@@ -388,6 +540,7 @@
         const ttsRateSlider = document.getElementById('tts-rate-slider');
         const ttsRateValue = document.getElementById('tts-rate-value');
         const vadEnableCheckbox = document.getElementById('vad-enable');
+        const vadStatusDisplay = document.getElementById('vad-status-display');
         const vadStatusIndicator = document.getElementById('vad-status-indicator');
         const vadStatusText = document.getElementById('vad-status-text');
         const whisperLangSelect = document.getElementById('whisper-lang-select');
@@ -397,15 +550,18 @@
         let currentAssistantMessageDiv = null; // Holds the div for the currently streaming response
         let isStreaming = false;
         let eventSource = null; // Holds the EventSource object
+        let currentAttachment = null; // Holds the File object for the staged attachment
 
         // --- Helper Functions ---
         function scrollToBottom() {
-            const container = document.getElementById('chatbox-container');
-            container.scrollTop = container.scrollHeight;
+            // Add small delay to allow DOM update before scrolling
+            setTimeout(() => {
+                chatboxContainer.scrollTop = chatboxContainer.scrollHeight;
+            }, 50);
         }
 
         function escapeHtml(unsafe) {
-            if (!unsafe) return "";
+            if (typeof unsafe !== 'string') return "";
             return unsafe
                 .replace(/&/g, "&amp;")
                 .replace(/</g, "&lt;")
@@ -414,153 +570,169 @@
                 .replace(/'/g, "&#039;");
         }
 
-        function addMessage(role, text, isHtml = false) {
-            console.log(`Adding message: ${role} - ${text.substring(0, 50)}...`);
+        // Simple Markdown Rendering (or use a library)
+        function renderContent(text) {
+            // Basic linkification
+            text = text.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank">$1</a>');
+            // Basic newline to <br>
+            let html = escapeHtml(text).replace(/\n/g, '<br>');
+            // If marked.js is loaded, use it for more complex markdown
+            if (typeof marked === 'function') {
+                // Configure marked for safety and basic rendering
+                marked.setOptions({
+                    breaks: true, // Convert GFM breaks into <br> tags
+                    gfm: true,
+                    sanitize: false, // Rely on initial escapeHtml for basic safety
+                    // Consider using DOMPurify here for robust sanitization if needed
+                });
+                try {
+                    // Need to convert <br> back for marked, then render
+                    html = marked.parse(html.replace(/<br\s*\/?>/gi, '\n'));
+                } catch (e) {
+                    console.error("Markdown parsing error:", e);
+                    // Fallback to basic HTML escaped version
+                    html = escapeHtml(text).replace(/\n/g, '<br>');
+                }
+            }
+            return html;
+        }
+
+
+        function addMessage(role, text, options = {}) {
+            console.log(`Adding message (${role}): ${text.substring(0, 60)}...`);
             const messageDiv = document.createElement('div');
             messageDiv.classList.add('message', role);
 
-            if (isHtml) {
-                messageDiv.innerHTML = text; // Use cautiously, ensure text is safe or sanitized
-            } else {
-                // Replace newlines with <br> for display, after escaping HTML
-                messageDiv.innerHTML = escapeHtml(text).replace(/\n/g, '<br>');
-            }
+            // Use provided ID or generate one if needed later
+            if (options.id) messageDiv.id = options.id;
+
+            // Render content using helper function (handles basic HTML escaping and optional Markdown)
+            messageDiv.innerHTML = renderContent(text);
 
             chatbox.appendChild(messageDiv);
             scrollToBottom();
-            return messageDiv;
+            return messageDiv; // Return the div for potential manipulation (like streaming)
         }
 
+
         function updateVadStatusUI(statusData) {
-            if (!statusData || !statusData.text || !statusData.color) return;
-            const colorVar = `--vad-${statusData.color.toLowerCase()}`;
-            vadStatusIndicator.style.backgroundColor = `var(${colorVar}, var(--vad-disabled))`; // Fallback color
+            if (!statusData || !statusData.text || !statusData.color) {
+                console.warn("Invalid VAD status data received:", statusData);
+                return;
+            }
+            const color = statusData.color.toLowerCase();
+            const colorVar = `--vad-${color}`;
+            vadStatusIndicator.style.backgroundColor = `var(${colorVar}, var(--vad-grey))`; // Fallback color
             vadStatusText.textContent = statusData.text;
-            vadStatusIndicator.title = `Voice input status: ${statusData.text}`;
+            vadStatusDisplay.title = `Voice input status: ${statusData.text}`;
+
+            // Update border color class for visual cue
+            const statusClasses = ['status-red', 'status-orange', 'status-blue', 'status-green'];
+            vadStatusDisplay.classList.remove(...statusClasses); // Remove existing status colors
+            if (color === 'red' || color === 'orange' || color === 'blue' || color === 'green') {
+                vadStatusDisplay.classList.add(`status-${color}`);
+            }
         }
 
 
         // --- API Interaction ---
-
         async function fetchApi(endpoint, options = {}) {
+            console.log(`API Call: ${options.method || 'GET'} ${endpoint}`);
             try {
                 const response = await fetch(endpoint, options);
                 if (!response.ok) {
-                    let errorMsg = `HTTP error! Status: ${response.status}`;
-                    try { // Try to get more details from response body
+                    let errorMsg = `API Error (${response.status})`;
+                    try {
                         const errorData = await response.json();
-                        errorMsg += ` - ${errorData.message || JSON.stringify(errorData)}`;
-                    } catch (e) { /* Ignore if body isn't JSON */ }
+                        errorMsg += `: ${errorData.message || JSON.stringify(errorData)}`;
+                    } catch (e) {
+                        errorMsg += `: ${response.statusText}`;
+                    }
                     throw new Error(errorMsg);
                 }
-                // Check content type before parsing JSON
+                // Handle JSON or empty responses
                 const contentType = response.headers.get("content-type");
-                if (contentType && contentType.indexOf("application/json") !== -1) {
+                if (contentType && contentType.includes("application/json")) {
                     return await response.json();
+                } else if (response.status === 204) { // No Content
+                    return null;
                 } else {
-                    // Handle non-JSON responses if necessary, or return null/text
-                    console.log(`Non-JSON response from ${endpoint}`);
-                    return await response.text(); // Or return response object itself
+                    console.warn(`Non-JSON response from ${endpoint}, status: ${response.status}`);
+                    // Return text or null depending on expected behavior
+                    return await response.text(); // Or just return null;
                 }
             } catch (error) {
-                console.error(`API Error (${endpoint}):`, error);
-                addMessage('error', `Network or API error: ${error.message}`);
-                throw error; // Re-throw for calling function to handle if needed
+                console.error(`Fetch Error (${endpoint}):`, error);
+                addMessage('error', `Network or API error: ${error.message || 'Unknown fetch error'}`);
+                // Re-throw might be useful for specific handling in callers, but often just logging is enough
+                // throw error;
+                return null; // Indicate failure
             }
         }
 
-        async function fetchInitialData() {
-            console.log("Fetching initial data...");
-            try {
-                // Fetch status first to populate controls
-                const status = await fetchApi('/api/status');
-                console.log("Initial Status:", status);
-                updateFullUIState(status);
-
-                // Fetch models and voices in parallel (if status didn't provide them)
-                const [modelsData, voicesData] = await Promise.all([
-                    fetchApi('/api/models'),
-                    fetchApi('/api/voices')
-                ]);
-
-                populateDropdown(modelSelect, modelsData.models || [], status.ollama_model);
-                populateDropdown(ttsVoiceSelect, (voicesData.voices || []).map(v => ({ value: v.id, text: v.name })), status.tts_voice_id);
-                populateDropdown(whisperLangSelect, Object.entries(LANGUAGES).map(([name, code]) => ({ value: code ?? 'null', text: name })), status.whisper_language ?? 'null');
-                populateDropdown(whisperModelSelect, WHISPER_MODELS, status.whisper_model);
-
-
-                // Fetch history last
-                const historyData = await fetchApi('/api/history');
-                chatbox.innerHTML = ''; // Clear loading/old messages
-                if (historyData.history && historyData.history.length > 0) {
-                    historyData.history.forEach(msg => {
-                        addMessage(msg.role, msg.content || '');
-                    });
-                } else {
-                    addMessage('status', 'Welcome! Start by typing a message.');
-                }
-                addMessage('status', `Backend ready. Ollama: ${status.ollama_model || 'N/A'}.`);
-
-            } catch (error) {
-                addMessage('error', `Failed to load initial data. Please check backend and refresh. ${error.message}`);
-            }
-        }
 
         // --- Send Message Logic ---
         async function sendMessageToServer() {
             const messageText = messageInput.value.trim();
-            const attachedFile = fileInput.files[0];
 
-            if (!messageText && !attachedFile) {
+            if (!messageText && !currentAttachment) {
                 addMessage('error', 'Please enter a message or attach a file.');
                 return;
             }
 
-            // Disable inputs
-            messageInput.disabled = true;
-            sendButton.disabled = true;
-            fileInputLabel.style.opacity = '0.6';
-            clearAttachmentBtn.style.display = 'none'; // Hide clear while sending
+            // Disable inputs during send
+            setSendingState(true);
 
             // Add user message visually (handle file indication)
             let displayMessage = messageText;
-            if (attachedFile) {
-                displayMessage += `\n[Attached: ${escapeHtml(attachedFile.name)}]`;
+            if (currentAttachment) {
+                displayMessage += `\n[Attached: ${escapeHtml(currentAttachment.name)}]`;
             }
             addMessage('user', displayMessage);
-
 
             // Use FormData for text and file
             const formData = new FormData();
             formData.append('message', messageText);
-            if (attachedFile) {
-                formData.append('file', attachedFile);
+            if (currentAttachment) {
+                formData.append('file', currentAttachment);
             }
 
-            // Clear inputs now
+            // Clear inputs *after* preparing FormData
             messageInput.value = '';
-            fileInput.value = null; // Clear file input
-            attachmentInfo.textContent = '';
+            clearAttachment(false); // Clear frontend state, don't notify backend yet
             updateTextareaHeight();
 
-
-            // --- Make API call ---
+            // Make API call
             try {
                 const response = await fetchApi('/api/send_message', {
                     method: 'POST',
-                    body: formData // Send FormData
+                    body: formData
                 });
-                console.log("Send response:", response);
-                // SSE stream will handle Ollama response display
-                // Input re-enabling is handled by stream_end or error events
+                if (!response || response.status !== 'success') {
+                    // Error handled by fetchApi or response indicates failure
+                    setSendingState(false); // Re-enable inputs on failure to send
+                }
+                // Success: Inputs remain disabled, waiting for stream_end/error event from SSE
             } catch (error) {
-                // Error already logged by fetchApi
-                // Re-enable inputs on send failure ONLY
-                messageInput.disabled = false;
-                sendButton.disabled = false;
-                fileInputLabel.style.opacity = '1';
-                // Don't re-show clear button as file wasn't sent
+                // Error handled by fetchApi
+                setSendingState(false); // Re-enable inputs on fetch error
             }
+        }
+
+        // Helper to manage input disabled state
+        function setSendingState(isSending) {
+            messageInput.disabled = isSending;
+            sendButton.disabled = isSending;
+            fileInputLabel.style.pointerEvents = isSending ? 'none' : 'auto';
+            fileInputLabel.style.opacity = isSending ? '0.6' : '1';
+            clearAttachmentBtn.disabled = isSending; // Also disable clear button
+            modelSelect.disabled = isSending; // Disable controls during response
+            ttsEnableCheckbox.disabled = isSending;
+            ttsVoiceSelect.disabled = isSending || !ttsEnableCheckbox.checked;
+            ttsRateSlider.disabled = isSending || !ttsEnableCheckbox.checked;
+            vadEnableCheckbox.disabled = isSending;
+            whisperLangSelect.disabled = isSending || !vadEnableCheckbox.checked;
+            whisperModelSelect.disabled = isSending || !vadEnableCheckbox.checked;
         }
 
         // --- SSE Handling ---
@@ -574,321 +746,331 @@
 
             eventSource.onopen = function () {
                 console.log("SSE Connection opened.");
-                addMessage('status', 'Connected to server.');
-                // Potentially re-enable inputs if they were disabled by error
-                messageInput.disabled = false;
-                sendButton.disabled = false;
-                fileInputLabel.style.opacity = '1';
+                addMessage('status', 'Connection established.');
+                setSendingState(false); // Ensure inputs are enabled on successful connect/reconnect
             };
 
             eventSource.onerror = function (event) {
                 console.error("SSE Error:", event);
-                // Stop streaming state
-                if (currentAssistantMessageDiv) {
-                    currentAssistantMessageDiv.classList.remove('streaming');
-                    currentAssistantMessageDiv = null;
-                    isStreaming = false;
+                // Finalize streaming state if connection drops mid-stream
+                finalizeStream();
+                if (event.target.readyState === EventSource.CLOSED) {
+                    addMessage('error', 'Connection to server closed. Attempting to reconnect...');
+                } else if (event.target.readyState === EventSource.CONNECTING) {
+                    addMessage('error', 'Connection lost. Reconnecting...');
+                } else {
+                    addMessage('error', 'An unknown SSE error occurred.');
                 }
-                // Indicate disconnection, disable inputs
-                addMessage('error', 'Connection lost. Attempting to reconnect...');
-                messageInput.disabled = true;
-                sendButton.disabled = true;
-                fileInputLabel.style.opacity = '0.6';
-                clearAttachmentBtn.style.display = 'none';
-
-                // Simple retry mechanism (browser usually handles this, but for explicit control)
-                // setTimeout(setupSSE, 5000); // Reconnect after 5s
+                setSendingState(true); // Disable inputs while disconnected/reconnecting
             };
 
-            // --- Specific Event Listeners ---
-            eventSource.addEventListener('stream_start', (event) => {
-                console.log("SSE: stream_start");
-                if (currentAssistantMessageDiv) { // Finalize previous if any overlap
-                    currentAssistantMessageDiv.classList.remove('streaming');
-                }
-                // Create a new div for the assistant message
-                currentAssistantMessageDiv = addMessage('assistant', ''); // Start empty
-                currentAssistantMessageDiv.classList.add('streaming');
-                isStreaming = true;
-                scrollToBottom();
-            });
-
-            eventSource.addEventListener('stream_chunk', (event) => {
-                // console.log("SSE: stream_chunk", event.data); // Noisy
-                if (!currentAssistantMessageDiv) { // Shouldn't happen if start works
-                    currentAssistantMessageDiv = addMessage('assistant', '');
-                    currentAssistantMessageDiv.classList.add('streaming');
-                }
-                if (isStreaming) {
-                    // Append chunk safely (handle potential HTML in chunks if needed, but default to text)
-                    const chunk = JSON.parse(event.data);
-                    currentAssistantMessageDiv.innerHTML += escapeHtml(chunk).replace(/\n/g, '<br>');
-                    scrollToBottom();
-                }
-            });
-
-            eventSource.addEventListener('stream_end', (event) => {
-                console.log("SSE: stream_end");
+            // Helper to finalize streaming UI state
+            function finalizeStream() {
                 if (currentAssistantMessageDiv) {
                     currentAssistantMessageDiv.classList.remove('streaming');
                 }
                 currentAssistantMessageDiv = null;
                 isStreaming = false;
-                // Re-enable inputs
-                messageInput.disabled = false;
-                sendButton.disabled = false;
-                fileInputLabel.style.opacity = '1';
-                // Don't re-show clear button here, file was consumed
+                setSendingState(false); // Re-enable inputs
                 messageInput.focus();
+            }
+
+            // --- Specific Event Listeners ---
+            eventSource.addEventListener('stream_start', (event) => {
+                console.log("SSE: stream_start");
+                finalizeStream(); // Ensure any previous stream is finalized
+                // Create a new div for the assistant message
+                currentAssistantMessageDiv = addMessage('assistant', ''); // Start empty
+                currentAssistantMessageDiv.classList.add('streaming');
+                isStreaming = true;
+                setSendingState(true); // Keep inputs disabled during stream
+                scrollToBottom();
             });
 
-            eventSource.addEventListener('error', (event) => {
-                const errorData = JSON.parse(event.data);
-                console.error("SSE: Backend Error:", errorData);
-                addMessage('error', errorData || 'Unknown backend error occurred.');
-                // Finalize streaming state on error
-                if (currentAssistantMessageDiv) {
-                    currentAssistantMessageDiv.classList.remove('streaming');
-                    currentAssistantMessageDiv = null;
-                    isStreaming = false;
-                }
-                // Re-enable inputs on backend error during stream
-                messageInput.disabled = false;
-                sendButton.disabled = false;
-                fileInputLabel.style.opacity = '1';
-            });
-
-            eventSource.addEventListener('status', (event) => {
-                const statusMsg = JSON.parse(event.data);
-                console.log("SSE: Status:", statusMsg);
-                addMessage('status', statusMsg);
-            });
-
-            eventSource.addEventListener('status_update', (event) => {
-                const statusUpdate = JSON.parse(event.data);
-                console.log("SSE: Status Update:", statusUpdate);
-                if (statusUpdate.source === 'vad') {
-                    updateVadStatusUI(statusUpdate.data);
-                }
-                // Handle other status sources if needed
-            });
-
-            eventSource.addEventListener('history_update', (event) => {
-                const historyData = JSON.parse(event.data);
-                console.log("SSE: History Update Received");
-                // Diffing is complex, easiest is to redraw (can cause flicker)
-                // Or just append if certain it's only new messages? Risky.
-                // Let's redraw for simplicity now.
-                chatbox.innerHTML = ''; // Clear
-                if (historyData && historyData.length > 0) {
-                    historyData.forEach(msg => {
-                        addMessage(msg.role, msg.content || '');
-                    });
-                }
-                // If streaming was interrupted by history update, reset state
-                if (isStreaming) {
-                    console.warn("History update interrupted streaming state.");
-                    isStreaming = false;
-                    currentAssistantMessageDiv = null;
-                }
-            });
-
-            eventSource.addEventListener('voices_update', (event) => {
-                const voices = JSON.parse(event.data);
-                console.log("SSE: Voices Update:", voices);
-                // Get current selected value before repopulating
-                const currentVoiceId = ttsVoiceSelect.value;
-                populateDropdown(ttsVoiceSelect, (voices || []).map(v => ({ value: v.id, text: v.name })), currentVoiceId);
-            });
-
-            // *** FIX FOR PROBLEM 1 (Voice Input) ***
-            eventSource.addEventListener('transcription', (event) => {
-                const transData = JSON.parse(event.data);
-                console.log("SSE: Transcription:", transData);
-                const transcriptionText = transData.text || '';
-                // Add transcription to chat history for visibility
-                addMessage('transcription', `🎤 Detected (${transData.language || 'auto'}): ${transcriptionText}`);
-
-                // *** Add the transcription to the input box ***
-                if (transcriptionText) {
-                    const currentInput = messageInput.value;
-                    if (currentInput && !currentInput.endsWith(' ')) {
-                        messageInput.value += ' '; // Add space if needed
+            eventSource.addEventListener('stream_chunk', (event) => {
+                if (isStreaming && currentAssistantMessageDiv) {
+                    try {
+                        const chunk = JSON.parse(event.data);
+                        // Append chunk safely (handles basic HTML and optional Markdown)
+                        // Note: Appending raw HTML can be slow if Markdown is complex.
+                        // Consider updating only text node for pure text chunks for performance.
+                        currentAssistantMessageDiv.innerHTML += renderContent(chunk);
+                        scrollToBottom();
+                    } catch (e) {
+                        console.error("Failed to parse or render SSE chunk:", e, event.data);
+                        // Append raw data as fallback
+                        currentAssistantMessageDiv.textContent += event.data;
                     }
-                    messageInput.value += transcriptionText;
-                    updateTextareaHeight(); // Adjust height after adding text
-                    messageInput.focus(); // Focus input box
-                    // Move cursor to the end
-                    messageInput.selectionStart = messageInput.selectionEnd = messageInput.value.length;
                 }
-                // Optional: Implement auto-send toggle here if desired
-                // if (document.getElementById('auto-send-checkbox').checked) { // Assuming checkbox exists
-                //    sendMessageToServer();
-                // }
             });
 
-            eventSource.addEventListener('full_status', (event) => {
-                const status = JSON.parse(event.data);
-                console.log("SSE: Received Full Status on Connect:", status);
-                updateFullUIState(status);
-                // Update controls that weren't updated during initial fetch maybe
-                // (Redundant if initial fetch worked, but safe fallback)
+            eventSource.addEventListener('stream_end', (event) => {
+                console.log("SSE: stream_end");
+                finalizeStream();
+            });
+
+            eventSource.addEventListener('error', (event) => { // Backend-originated errors
+                try {
+                    const errorData = JSON.parse(event.data);
+                    console.error("SSE: Backend Error:", errorData);
+                    addMessage('error', errorData || 'Unknown backend error occurred.');
+                } catch (e) {
+                    console.error("SSE: Failed to parse error event data:", event.data);
+                    addMessage('error', 'Received unparsable error from backend.');
+                }
+                finalizeStream(); // Also finalize stream on backend error
+            });
+
+            eventSource.addEventListener('status', (event) => { // General status messages
+                try {
+                    const statusMsg = JSON.parse(event.data);
+                    console.log("SSE: Status:", statusMsg);
+                    addMessage('status', statusMsg);
+                } catch (e) { console.error("Failed to parse status event data:", event.data); }
+            });
+
+            eventSource.addEventListener('status_update', (event) => { // Specific component status (like VAD)
+                try {
+                    const statusUpdate = JSON.parse(event.data);
+                    console.log("SSE: Status Update:", statusUpdate);
+                    if (statusUpdate.source === 'vad' && statusUpdate.data) {
+                        updateVadStatusUI(statusUpdate.data);
+                    }
+                    // Handle other status sources if needed (e.g., TTS busy state)
+                } catch (e) { console.error("Failed to parse status_update event data:", event.data); }
+            });
+
+            eventSource.addEventListener('history_update', (event) => { // Full history refresh
+                try {
+                    const historyData = JSON.parse(event.data);
+                    console.log("SSE: History Update Received");
+                    chatbox.innerHTML = ''; // Clear existing messages
+                    if (historyData && historyData.length > 0) {
+                        historyData.forEach(msg => {
+                            addMessage(msg.role, msg.content || '');
+                        });
+                    } else {
+                        addMessage('status', 'Chat history cleared or empty.');
+                    }
+                    finalizeStream(); // Ensure streaming state is reset if history overwrites it
+                } catch (e) { console.error("Failed to parse history_update event data:", event.data); }
+            });
+
+            eventSource.addEventListener('voices_update', (event) => { // TTS Voice list update
+                try {
+                    const voices = JSON.parse(event.data);
+                    console.log("SSE: Voices Update:", voices);
+                    const currentVoiceId = ttsVoiceSelect.value; // Preserve selection
+                    populateDropdown(ttsVoiceSelect, (voices || []).map(v => ({ value: v.id, text: v.name })), currentVoiceId);
+                } catch (e) { console.error("Failed to parse voices_update event data:", event.data); }
+            });
+
+            eventSource.addEventListener('transcription', (event) => { // Whisper transcription result
+                try {
+                    const transData = JSON.parse(event.data);
+                    console.log("SSE: Transcription:", transData);
+                    const transcriptionText = transData.text || '';
+                    // Add transcription to chat history for visibility
+                    addMessage('transcription', `🎤 (${transData.language || 'auto'}): ${transcriptionText}`);
+
+                    // Add the transcription to the input box
+                    if (transcriptionText) {
+                        const currentInput = messageInput.value;
+                        // Add space if input not empty and doesn't end with space
+                        if (currentInput && !/\s$/.test(currentInput)) {
+                            messageInput.value += ' ';
+                        }
+                        messageInput.value += transcriptionText;
+                        updateTextareaHeight(); // Adjust height after adding text
+                        messageInput.focus();
+                        // Move cursor to the end
+                        messageInput.selectionStart = messageInput.selectionEnd = messageInput.value.length;
+                    }
+                    // Optional: Implement auto-send toggle here if desired
+                    // if (document.getElementById('auto-send-checkbox')?.checked) { sendMessageToServer(); }
+                } catch (e) { console.error("Failed to parse transcription event data:", event.data); }
+            });
+
+            eventSource.addEventListener('full_status', (event) => { // Initial status on connect
+                try {
+                    const status = JSON.parse(event.data);
+                    console.log("SSE: Received Full Status on Connect/Reconnect:", status);
+                    updateFullUIState(status);
+                } catch (e) { console.error("Failed to parse full_status event data:", event.data); }
             });
         }
 
         // --- Control/Settings Logic ---
 
-        function populateDropdown(selectElement, items, selectedValue) {
+        function populateDropdown(selectElement, items, selectedValue, isKeyValue = false) {
+            const currentVal = selectElement.value; // Store current value before clearing
             selectElement.innerHTML = ''; // Clear existing options
-            if (!items || items.length === 0) {
+
+            if (!items || (Array.isArray(items) && items.length === 0) || (typeof items === 'object' && !Array.isArray(items) && Object.keys(items).length === 0)) {
                 selectElement.disabled = true;
                 selectElement.innerHTML = '<option value="">N/A</option>';
                 return;
             }
 
             selectElement.disabled = false;
-            items.forEach(item => {
-                const option = document.createElement('option');
-                if (typeof item === 'string') {
-                    option.value = item;
-                    option.textContent = item;
-                } else { // Assume {value: v, text: t} format
-                    option.value = item.value;
-                    option.textContent = item.text;
-                }
-                selectElement.appendChild(option);
-            });
 
-            // Try setting the selected value
-            if (selectedValue !== undefined && selectedValue !== null) {
-                selectElement.value = selectedValue;
-                // If the value didn't exist, it might reset to the first option. Check this.
-                if (selectElement.value !== String(selectedValue)) {
-                    console.warn(`Value "${selectedValue}" not found in dropdown ${selectElement.id}, defaulting to first option.`);
-                    if (items.length > 0) {
-                        selectElement.selectedIndex = 0; // Select first item as fallback
+            if (Array.isArray(items)) { // Handle array of strings or objects
+                items.forEach(item => {
+                    const option = document.createElement('option');
+                    if (typeof item === 'string') {
+                        option.value = item;
+                        option.textContent = item;
+                    } else { // Assume {value: v, text: t} format
+                        option.value = item.value;
+                        option.textContent = item.text;
+                    }
+                    selectElement.appendChild(option);
+                });
+            } else if (typeof items === 'object' && !Array.isArray(items)) { // Handle key-value object (like languages)
+                Object.entries(items).forEach(([key, value]) => {
+                    const option = document.createElement('option');
+                    // Store the value (e.g., language code, could be null)
+                    // Need consistent way to handle null value in select
+                    option.value = (value === null || value === undefined) ? 'null' : value;
+                    option.textContent = key; // Display the key (e.g., language name)
+                    selectElement.appendChild(option);
+                });
+            }
+
+
+            // Try setting the selected value (handle null/undefined consistently)
+            const valueToSet = (selectedValue === null || selectedValue === undefined) ? 'null' : String(selectedValue);
+            selectElement.value = valueToSet;
+
+            // If the value didn't exist, try restoring previous or default to first
+            if (selectElement.value !== valueToSet) {
+                console.warn(`Value "${selectedValue}" (mapped to "${valueToSet}") not found in dropdown ${selectElement.id}.`);
+                if (selectElement.options.length > 0) {
+                    selectElement.value = currentVal; // Try restoring previous selection first
+                    if (selectElement.value !== currentVal) { // If previous also invalid, default to first
+                        selectElement.selectedIndex = 0;
                     }
                 }
-            } else if (items.length > 0) {
-                selectElement.selectedIndex = 0; // Select first if no specific value given
             }
+            // Trigger change event manually if needed, e.g., after initial population
+            // selectElement.dispatchEvent(new Event('change'));
         }
 
+
+        // Update UI based on the full status object from backend
         function updateFullUIState(status) {
-            // Update controls based on the full status object
-            modelSelect.value = status.ollama_model || '';
+            console.log("Updating UI from full status:", status);
+            if (!status) {
+                addMessage('error', "Received invalid status from backend.");
+                return;
+            }
+
+            // Populate dropdowns first, then set values
+            populateDropdown(modelSelect, status.ollama_models || [], status.ollama_model);
+            populateDropdown(ttsVoiceSelect, (status.tts_voices || []).map(v => ({ value: v.id, text: v.name })), status.tts_voice_id);
+            populateDropdown(whisperLangSelect, status.whisper_languages || {}, status.whisper_language);
+            populateDropdown(whisperModelSelect, status.whisper_models || [], status.whisper_model);
+
+            // Set control states
             ttsEnableCheckbox.checked = status.tts_enabled || false;
-            ttsVoiceSelect.value = status.tts_voice_id || '';
             ttsRateSlider.value = status.tts_rate || 160;
             ttsRateValue.textContent = status.tts_rate || 160;
             vadEnableCheckbox.checked = status.vad_enabled || false;
-            updateVadStatusUI(status.vad_status);
-            whisperLangSelect.value = status.whisper_language ?? 'null'; // Handle null for auto
-            whisperModelSelect.value = status.whisper_model || '';
+            updateVadStatusUI(status.vad_status || { text: "Unknown", color: "grey" });
 
-            // Update attachment display
+            // Update attachment display from status (if file is staged on backend)
+            // This is less common now as file is sent with message, but keep for potential future use
             if (status.attachment && status.attachment.filename) {
                 attachmentInfo.textContent = ` ${status.attachment.filename}`;
                 clearAttachmentBtn.style.display = 'inline-block';
-            } else {
+                // Note: We don't restore the actual File object here
+            } else if (!currentAttachment) { // Only clear if frontend doesn't have a file
                 attachmentInfo.textContent = '';
                 clearAttachmentBtn.style.display = 'none';
             }
 
-            // Enable/disable voice/rate controls based on TTS status
-            ttsVoiceSelect.disabled = !status.tts_enabled;
+            // Enable/disable dependent controls
+            ttsVoiceSelect.disabled = !status.tts_enabled || status.tts_voices?.length === 0;
             ttsRateSlider.disabled = !status.tts_enabled;
-            // Enable/disable whisper controls based on VAD status
             whisperLangSelect.disabled = !status.vad_enabled;
             whisperModelSelect.disabled = !status.vad_enabled;
         }
 
-
-        // Add event listeners for controls
-        modelSelect.addEventListener('change', async () => {
-            await fetchApi('/api/control/model', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model: modelSelect.value })
+        // --- Initialize Control Listeners ---
+        function setupControlListeners() {
+            modelSelect.addEventListener('change', () => {
+                fetchApi('/api/control/model', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model: modelSelect.value })
+                });
             });
-            // Status update ideally comes via SSE, but could force refresh: fetchApi('/api/status').then(updateFullUIState);
-        });
 
-        ttsEnableCheckbox.addEventListener('change', async () => {
-            const enabled = ttsEnableCheckbox.checked;
-            try {
-                const data = await fetchApi('/api/control/tts', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+            ttsEnableCheckbox.addEventListener('change', async () => {
+                const enabled = ttsEnableCheckbox.checked;
+                const response = await fetchApi('/api/control/tts', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ enable: enabled })
                 });
-                // Update dependent controls immediately based on response
-                ttsVoiceSelect.disabled = !data.tts_enabled;
-                ttsRateSlider.disabled = !data.tts_enabled;
-            } catch (e) {
-                ttsEnableCheckbox.checked = !enabled; // Revert on error
-            }
-
-        });
-
-        ttsVoiceSelect.addEventListener('change', async () => {
-            await fetchApi('/api/control/tts_settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ voice_id: ttsVoiceSelect.value })
+                // Update dependent controls based on actual backend state returned/updated via SSE
+                if (response) { // If API call succeeded
+                    ttsVoiceSelect.disabled = !response.tts_enabled;
+                    ttsRateSlider.disabled = !response.tts_enabled;
+                } else {
+                    ttsEnableCheckbox.checked = !enabled; // Revert checkbox on API error
+                }
             });
-        });
 
-        ttsRateSlider.addEventListener('input', () => { // Update value display live
-            ttsRateValue.textContent = ttsRateSlider.value;
-        });
-        ttsRateSlider.addEventListener('change', async () => { // Send API call on release
-            await fetchApi('/api/control/tts_settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ rate: parseInt(ttsRateSlider.value) })
+            ttsVoiceSelect.addEventListener('change', () => {
+                fetchApi('/api/control/tts_settings', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ voice_id: ttsVoiceSelect.value })
+                });
             });
-        });
 
+            ttsRateSlider.addEventListener('input', () => { // Update value display live
+                ttsRateValue.textContent = ttsRateSlider.value;
+            });
+            ttsRateSlider.addEventListener('change', () => { // Send API call on release
+                fetchApi('/api/control/tts_settings', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ rate: parseInt(ttsRateSlider.value) })
+                });
+            });
 
-        vadEnableCheckbox.addEventListener('change', async () => {
-            const enabled = vadEnableCheckbox.checked;
-            vadEnableCheckbox.disabled = true; // Disable during state change
-            try {
-                const data = await fetchApi('/api/control/vad', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+            vadEnableCheckbox.addEventListener('change', async () => {
+                const enabled = vadEnableCheckbox.checked;
+                vadEnableCheckbox.disabled = true; // Disable during state change
+                const response = await fetchApi('/api/control/vad', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ enable: enabled })
                 });
-                // Update dependent controls immediately based on response
-                whisperLangSelect.disabled = !data.vad_enabled;
-                whisperModelSelect.disabled = !data.vad_enabled;
-                // Update VAD status indicator based on response too
-                updateVadStatusUI(data.current_status);
-            } catch (e) {
-                vadEnableCheckbox.checked = !enabled; // Revert on error
-            } finally {
                 vadEnableCheckbox.disabled = false; // Re-enable checkbox
-            }
-
-        });
-
-        whisperLangSelect.addEventListener('change', async () => {
-            const selectedLang = whisperLangSelect.value === 'null' ? null : whisperLangSelect.value;
-            await fetchApi('/api/control/whisper_settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ language_code: selectedLang })
+                if (response) {
+                    // Update dependent controls based on actual state
+                    whisperLangSelect.disabled = !response.vad_enabled;
+                    whisperModelSelect.disabled = !response.vad_enabled;
+                    // VAD status indicator updated via SSE's status_update or full_status
+                } else {
+                    vadEnableCheckbox.checked = !enabled; // Revert on error
+                }
             });
-        });
 
-        whisperModelSelect.addEventListener('change', async () => {
-            await fetchApi('/api/control/whisper_settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model_size: whisperModelSelect.value })
+            whisperLangSelect.addEventListener('change', () => {
+                // Handle the 'null' value for Auto Detect
+                const selectedLang = whisperLangSelect.value === 'null' ? null : whisperLangSelect.value;
+                fetchApi('/api/control/whisper_settings', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ language_code: selectedLang })
+                });
             });
-        });
+
+            whisperModelSelect.addEventListener('change', () => {
+                fetchApi('/api/control/whisper_settings', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model_size: whisperModelSelect.value })
+                });
+            });
+        }
 
 
         // --- Other Event Listeners ---
@@ -896,57 +1078,67 @@
 
         messageInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
+                e.preventDefault(); // Prevent default newline behavior
                 sendMessageToServer();
             }
         });
+        // Allow Shift+Enter for newline by default
 
-        // Auto-resize textarea
+
+        // Auto-resize textarea based on content
         function updateTextareaHeight() {
-            messageInput.style.height = 'auto'; // Temporarily shrink
-            // Set height based on scroll height, but capped by max-height
-            const newHeight = Math.min(messageInput.scrollHeight, 150); // 150px is max-height from CSS
-            messageInput.style.height = `${newHeight}px`;
+            messageInput.style.height = 'auto'; // Temporarily shrink to get accurate scrollHeight
+            const scrollHeight = messageInput.scrollHeight;
+            const maxHeight = 150; // From CSS max-height
+            // Set height based on content, but cap at max-height
+            messageInput.style.height = `${Math.min(scrollHeight, maxHeight)}px`;
         }
         messageInput.addEventListener('input', updateTextareaHeight);
 
 
-        // File input handling
+        // --- File Input Handling ---
         fileInput.addEventListener('change', () => {
             if (fileInput.files.length > 0) {
                 const file = fileInput.files[0];
+                // Basic file size check (e.g., 50MB limit)
+                const maxSize = 50 * 1024 * 1024;
+                if (file.size > maxSize) {
+                    addMessage('error', `File too large: ${file.name} (${(file.size / 1024 / 1024).toFixed(1)}MB). Max size is 50MB.`);
+                    fileInput.value = null; // Clear the input
+                    return;
+                }
+                currentAttachment = file; // Store the File object
                 attachmentInfo.textContent = ` ${file.name}`;
                 clearAttachmentBtn.style.display = 'inline-block';
+                // No backend notification needed here, file is sent with message
             } else {
-                attachmentInfo.textContent = '';
-                clearAttachmentBtn.style.display = 'none';
+                clearAttachment(false); // Clear frontend state if selection cancelled
             }
         });
 
-        clearAttachmentBtn.addEventListener('click', async () => {
-            fileInput.value = null; // Clear the actual input
+        // Function to clear attachment state (frontend and optionally backend)
+        function clearAttachment(notifyBackend = true) {
+            const attachmentWasPresent = !!currentAttachment;
+            fileInput.value = null; // Clear the actual input element
+            currentAttachment = null; // Clear the stored File object
             attachmentInfo.textContent = '';
             clearAttachmentBtn.style.display = 'none';
-            // Optionally notify backend the attachment was cleared *before* sending next message
-            try {
-                await fetchApi('/api/clear_attachment', { method: 'POST' });
-            } catch (e) { /* Ignore error here, clearing is best-effort */ }
-        });
-
-        // --- Constants for dropdowns ---
-        const LANGUAGES = {
-            "Auto Detect": null, "English": "en", "Finnish": "fi", "Swedish": "sv",
-            "German": "de", "French": "fr", "Spanish": "es", "Italian": "it",
-            "Russian": "ru", "Chinese": "zh", "Japanese": "ja"
-        };
-        const WHISPER_MODELS = ["tiny", "base", "small", "medium", "large", "turbo-tiny", "turbo-base", "turbo-small", "turbo-medium", "turbo-large"];
+            // Optionally notify backend that the staged file was cleared by user
+            if (notifyBackend && attachmentWasPresent) {
+                fetchApi('/api/clear_attachment', { method: 'POST' });
+            }
+        }
+        clearAttachmentBtn.addEventListener('click', () => clearAttachment(true));
 
 
         // --- Initial Load ---
         document.addEventListener('DOMContentLoaded', () => {
-            fetchInitialData(); // Load history, models, voices, status
-            setupSSE();         // Connect to the stream
-            updateTextareaHeight(); // Initial textarea height
+            chatbox.innerHTML = '<div class="status">Loading initial data...<div class="spinner"></div></div>';
+            setupControlListeners(); // Setup listeners for controls
+            setupSSE();             // Connect to the SSE stream (will trigger full_status)
+            updateTextareaHeight(); // Set initial textarea height
+            messageInput.focus();
+            // Initial data (models, history etc) is now primarily loaded via SSE 'full_status' event
         });
 
     </script>
