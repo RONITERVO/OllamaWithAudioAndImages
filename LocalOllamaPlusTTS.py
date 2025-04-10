@@ -1,3 +1,4 @@
+#Lisää database, kaikelle yleis tiedolle jota tarvitset usein. 
 import ollama
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, ttk
@@ -20,6 +21,8 @@ from collections import deque
 import traceback
 import fitz
 from tkinterdnd2 import TkinterDnD, DND_FILES
+import re
+from typing import Optional
 
 
 # ===================
@@ -291,6 +294,61 @@ def queue_tts_text(new_text):
     if tts_enabled.get() and tts_initialized_successfully:
         tts_sentence_buffer += new_text
 
+def clean_text_for_tts(text):
+    """Removes markdown formatting from text for better TTS reading.
+    Distinguishes between mathematical operations and emphasized variables."""
+    if not text:
+        return text
+    
+    import re
+    
+    # First identify variable patterns: single letter/word surrounded by asterisks
+    # This regex finds patterns like *a*, *x*, *variable*
+    result = re.sub(r'\*([a-zA-Z0-9]+)\*', r'\1', text)
+    
+    # Now handle actual multiplication operations (only replace asterisks between numbers/complex expressions)
+    # Look for patterns with digits or expressions on both sides
+    result = re.sub(r'([\d.]+)\s*\*\s*([\d.]+)', r'\1 × \2', result)
+    
+    # Handle special cases like (a+b)*(c+d) or 2*(a+b)
+    result = re.sub(r'(\)|\d])\s*\*\s*([\w(])', r'\1 × \2', result)
+    
+    # Handle superscript notation for exponents - one regex for all cases
+    def replace_superscript(match):
+        base = match.group(1)
+        exponent = match.group(2)
+        # Map common exponents to words
+        exponent_words = {
+            '²': 'squared',
+            '³': 'cubed'
+        }
+        # Use the map for common cases, or "to the power of" for others
+        if exponent in exponent_words:
+            return f"{base} {exponent_words[exponent]}"
+        # Try to convert the superscript to a normal number for "to the power of"
+        # Map of superscript characters to their normal counterparts
+        superscript_map = {
+            '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4', 
+            '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9'
+        }
+        # Convert the superscript to normal digits
+        power_value = ''.join(superscript_map.get(c, c) for c in exponent)
+        return f"{base} to the power of {power_value}"
+    
+    # Apply the replacement for any character followed by any superscript digit(s)
+    result = re.sub(r'([a-zA-Z0-9])([²³⁰¹⁴⁵⁶⁷⁸⁹]+)', replace_superscript, result)
+    
+    # Handle bullet points at start of lines
+    result = re.sub(r'(^|\n)\s*\*\s', r'\1', result)
+    
+    # Handle "/n * " sequence (newline followed by bullet)
+    result = result.replace("/n * ", "\n")
+    
+    # Remove any remaining emphasis asterisks (bold/italic)
+    result = re.sub(r'\*\*([^*]+)\*\*', r'\1', result)  # Bold (**word**)
+    
+    return result
+
 def try_flush_tts_buffer():
     """Sends complete sentences from the buffer to the TTS queue if TTS is idle."""
     global tts_sentence_buffer, tts_busy, tts_queue
@@ -329,8 +387,9 @@ def try_flush_tts_buffer():
     chunk_to_speak = "".join(temp_buffer).strip()
 
     if chunk_to_speak:
-        # print(f"[TTS] Queuing chunk: '{chunk_to_speak[:50]}...' ({len(chunk_to_speak)} chars)")
-        tts_queue.put(chunk_to_speak)
+        # Apply the text cleaning for TTS
+        clean_chunk = clean_text_for_tts(chunk_to_speak)
+        tts_queue.put(clean_chunk)
         # No need to set tts_busy here, worker thread handles it
 
 def periodic_tts_check():
@@ -1325,7 +1384,7 @@ window.geometry(WINDOW_GEOMETRY)
 
 # --- Tkinter Variables ---
 tts_enabled = tk.BooleanVar(value=True)
-tts_rate = tk.IntVar(value=160)
+tts_rate = tk.IntVar(value=200)
 tts_voice_id = tk.StringVar(value="")
 voice_enabled = tk.BooleanVar(value=True)
 auto_send_after_transcription = tk.BooleanVar(value=True)
@@ -1387,7 +1446,7 @@ if available_voices:
     # Try to find a default or common voice (e.g., Zira, David, Hazel for Windows/Mac)
     default_voice_index = 0
     for i, (name, v_id) in enumerate(available_voices):
-        if any(common in name for common in ["Zira", "David", "Hazel", "Susan"]):
+        if any(common in name for common in ["David", "Zira", "Hazel", "Susan"]):
             default_voice_index = i
             break
     voice_selector.current(default_voice_index)
