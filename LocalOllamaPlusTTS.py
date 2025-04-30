@@ -39,7 +39,7 @@ WINDOW_GEOMETRY = "850x850"
 
 # --- Models ---
 DEFAULT_OLLAMA_MODEL = "gemma3:27b"
-DEFAULT_WHISPER_MODEL_SIZE = "base" # Faster startup, change to 'medium' or 'large' for better accuracy
+DEFAULT_WHISPER_MODEL_SIZE = "turbo-large" # Faster startup, change to 'medium' or 'large' for better accuracy
 
 # --- Whisper ---
 WHISPER_LANGUAGES = [
@@ -89,6 +89,7 @@ whisper_processing_thread = None
 whisper_language = None     # Set via UI, default None (auto)
 voice_enabled = None        # tk.BooleanVar
 recording_indicator_widget = None # Assign after Tkinter setup
+auto_send_after_transcription = None
 user_input_widget = None    # Assign after Tkinter setup
 
 # --- Audio Handling ---
@@ -164,7 +165,8 @@ def set_speech_rate(value=None): # Updated to accept value from scale command
     global tts_engine, tts_rate, tts_initialized_successfully
     if not tts_initialized_successfully or not tts_engine: return
     try:
-        rate = tts_rate.get()
+        rate = int(float(value))
+        tts_rate.set(rate)
         tts_engine.setProperty('rate', rate)
         # print(f"[TTS] Speech rate set to: {rate}") # Optional: Can be noisy
     except Exception as e:
@@ -641,6 +643,10 @@ def update_input_with_transcription(text):
         user_input_widget.insert("1.0", text)
     # Optionally: Automatically send message after transcription?
     # send_message()
+        # Automatically send message if option is enabled
+    if auto_send_after_transcription.get():
+        # Small delay to let UI update first
+        window.after(100, send_message)
 
 
 def toggle_voice_recognition():
@@ -648,6 +654,8 @@ def toggle_voice_recognition():
     global voice_enabled, whisper_initialized, vad_initialized, vad_thread, vad_stop_event
     global py_audio, whisper_processing_thread
 
+    set_whisper_language()
+    
     if voice_enabled.get():
         print("[Voice] Enabling voice recognition...")
         all_initialized = True
@@ -1093,10 +1101,11 @@ window.title(APP_TITLE)
 window.geometry(WINDOW_GEOMETRY)
 
 # --- Tkinter Variables ---
-tts_enabled = tk.BooleanVar(value=False)
+tts_enabled = tk.BooleanVar(value=True)
 tts_rate = tk.IntVar(value=160)
 tts_voice_id = tk.StringVar(value="")
-voice_enabled = tk.BooleanVar(value=False)
+voice_enabled = tk.BooleanVar(value=True)
+auto_send_after_transcription = tk.BooleanVar(value=True)
 selected_whisper_language = tk.StringVar()
 selected_whisper_model = tk.StringVar(value=whisper_model_size)
 
@@ -1166,7 +1175,7 @@ voice_selector.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
 # Rate Control
 rate_frame = tk.Frame(tts_outer_frame)
 rate_frame.pack(fill=tk.X, pady=2)
-tk.Label(rate_frame, text="Rate:", font=("Arial", 8)).pack(side=tk.LEFT)
+tk.Label(rate_frame, text="Talking speed:", font=("Arial", 8)).pack(side=tk.LEFT)
 rate_scale = ttk.Scale(rate_frame, from_=80, to=300, orient=tk.HORIZONTAL, variable=tts_rate, command=set_speech_rate, state="disabled") # Start disabled
 rate_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
 rate_value = tk.Label(rate_frame, textvariable=tts_rate, width=3, font=("Arial", 8))
@@ -1190,7 +1199,7 @@ tk.Label(lang_frame, text="Lang:", font=("Arial", 8)).pack(side=tk.LEFT)
 whisper_language_selector = ttk.Combobox(lang_frame, values=[lang[0] for lang in WHISPER_LANGUAGES],
                                          state="readonly", width=10, font=("Arial", 8),
                                          textvariable=selected_whisper_language)
-whisper_language_selector.current(0) # Default to Auto Detect
+whisper_language_selector.current(1) # Default to Auto Detect
 whisper_language_selector.pack(side=tk.LEFT, padx=2)
 whisper_language_selector.bind("<<ComboboxSelected>>", set_whisper_language)
 
@@ -1203,6 +1212,11 @@ whisper_model_size_selector = ttk.Combobox(size_frame, values=WHISPER_MODEL_SIZE
                                            textvariable=selected_whisper_model)
 whisper_model_size_selector.pack(side=tk.LEFT, padx=2)
 whisper_model_size_selector.bind("<<ComboboxSelected>>", set_whisper_model_size)
+
+# Auto-send checkbox
+auto_send_checkbox = ttk.Checkbutton(voice_outer_frame, text="Auto-send after transcription", 
+                                     variable=auto_send_after_transcription)
+auto_send_checkbox.pack(anchor="w", pady=2)
 
 
 # Recording Status Indicator (moved here for better placement)
@@ -1290,11 +1304,12 @@ else:
          add_message_to_ui("status", "Note: TTS engine failed to initialize. TTS controls disabled.")
     window.after(500, show_tts_init_error) # Delay slightly
 
+# Initialize TTS and voice recognition since they're enabled by default
+window.after(1000, toggle_tts)  # Call after GUI is fully loaded
+window.after(1500, toggle_voice_recognition)  # Call with slight delay after TTS
+
 # Start periodic checks (TTS flush)
 window.after(200, periodic_tts_check)
-
-# Add initial welcome message
-add_message_to_ui("assistant", "Welcome! Select a model, type a message, attach an image, or enable voice input.")
 
 # --- Start Main Loop ---
 window.mainloop()
